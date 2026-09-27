@@ -53,7 +53,9 @@ pub struct ClusterItem {
 ///    cluster if it is at least `recluster_threshold - 0.1` similar. Embedded segments
 ///    without an online label join the nearest cluster.
 /// 5. With a `voiceprint`, the cluster most similar to it becomes `"me"` if its centroid
-///    reaches [`ClusterConfig::voiceprint_threshold`].
+///    reaches [`ClusterConfig::voiceprint_threshold`]. This applies to every prefix in
+///    `items`, so re-cluster sources that can't contain the user (the call) separately,
+///    without it.
 /// 6. The other clusters take over online labels by maximum total overlap (duration of
 ///    segments that had that label online), one label per cluster, so names the user gave
 ///    stay with the person and as little as possible changes. Clusters left without a label

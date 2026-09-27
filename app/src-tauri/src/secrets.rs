@@ -67,6 +67,31 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(path).with_context(|| format!("writing {}", path.display()))?;
+    // `mode` only applies when the file is created; tighten a pre-existing one too.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
     f.write_all(contents.as_bytes())?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn existing_key_file_is_made_private() {
+        let dir = std::env::temp_dir().join(format!("kenes-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api_key");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_private(&path, "sk-ant-new").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "sk-ant-new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

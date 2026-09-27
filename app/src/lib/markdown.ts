@@ -199,7 +199,10 @@ function parseList(lines: string[], from: number): [ListBlock, number] {
       if (indent < baseIndent) break;
       if (indent > baseIndent && list.items.length) {
         const [child, next] = parseList(lines, i);
-        list.items[list.items.length - 1].children = child;
+        const parent = list.items[list.items.length - 1];
+        // A second nested run under the same item (other indent or list type) extends the first.
+        if (parent.children) parent.children.items.push(...child.items);
+        else parent.children = child;
         i = next;
         continue;
       }

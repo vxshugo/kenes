@@ -1,8 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Segment, SpeakerChange } from "../types";
+import { DEFAULT_TOKENS_PER_CHAR, payloadChars } from "./budget";
 import {
+  carryoverBlock,
   cleanText,
   compareSegments,
+  formatSegmentLine,
   formatTranscript,
   fullTranscriptBlock,
   renameNote,
@@ -10,6 +13,7 @@ import {
   transcriptUpdateBlock,
 } from "./prompts";
 import { compareLabels, defaultSpeakerName, type SpeakerDirectory } from "./speakers";
+import { namesMapLine } from "./tasks";
 
 export type TextBlock = Anthropic.Beta.Messages.BetaTextBlockParam;
 export type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
@@ -35,6 +39,17 @@ type UserTurn = {
 type AssistantTurn = { role: "assistant"; text: string };
 type Turn = UserTurn | AssistantTurn;
 
+/** What a rollover kept and dropped. */
+export type RolloverInfo = {
+  /** Number of the new log, from 1. */
+  epoch: number;
+  /** Transcript lines carried into the new log verbatim. */
+  carriedLines: number;
+  /** Older lines left out (covered by the summary, when there is one). */
+  droppedLines: number;
+  summary: boolean;
+};
+
 /**
  * Per-meeting, append-only message log laid out for prompt caching:
  *
@@ -51,6 +66,11 @@ type Turn = UserTurn | AssistantTurn;
  * Speaker names: lines are rendered with the names current when they are sent and never
  * re-rendered. A rename therefore adds a note («Участник 3 теперь зовут Айдос.») to the
  * next user turn instead of rewriting earlier turns.
+ *
+ * Long meetings: `rollover()` starts a new log (an "epoch") seeded with the rolling summary
+ * and the recent transcript, when the old one nears the model's context window. The log is
+ * append-only within each epoch; the first request of a new epoch shares only the system
+ * prompt and the context block with the old one.
  */
 export class Conversation {
   private readonly systemBlocks: readonly string[];
@@ -59,6 +79,11 @@ export class Conversation {
   private pending: string[] = [];
   /** What the committed + in-flight log has told Claude each label is called. */
   private names: NameState = new Map();
+  /** Opening block of the current epoch after a rollover: summary + recent transcript. */
+  private carryover: string | null = null;
+  private epochs = 0;
+  /** Prompt tokens and characters of the last request that got a response, for estimates. */
+  private calibration: { tokens: number; chars: number } | null = null;
 
   constructor(
     systemPrompt: string,
@@ -99,6 +124,86 @@ export class Conversation {
 
   pendingCount(): number {
     return this.pending.length;
+  }
+
+  /** How many times the log was restarted from a summary (0 = still the first log). */
+  get epoch(): number {
+    return this.epochs;
+  }
+
+  /** Records a response's prompt size (input + cache read + cache write) for `request`. */
+  observe(request: RequestPayload, promptTokens: number): void {
+    const chars = payloadChars(request);
+    if (promptTokens > 0 && chars > 0) this.calibration = { tokens: promptTokens, chars };
+  }
+
+  /** Tokens per character, measured on this meeting's text once a response has arrived. */
+  tokensPerChar(): number {
+    const c = this.calibration;
+    return c ? c.tokens / c.chars : DEFAULT_TOKENS_PER_CHAR;
+  }
+
+  /** Estimated prompt tokens of the live turn `beginTurn(taskText)` would send. Changes nothing. */
+  estimateTurn(taskText: string): number {
+    const { blocks } = this.updateBlocks(this.pending, this.names);
+    const preview: Turn[] = [...this.turns, { role: "user", blocks: [...blocks, taskText], segmentIds: [], namesBefore: this.names }];
+    return Math.ceil(payloadChars(this.render(preview, "last")) * this.tokensPerChar());
+  }
+
+  /** Estimated prompt tokens of `fork(taskText)`. */
+  estimateFork(taskText: string): number {
+    return Math.ceil(payloadChars(this.fork(taskText)) * this.tokensPerChar());
+  }
+
+  /** The newest finals whose rendered lines fit `maxChars` (at least one), oldest first. */
+  private tail(all: readonly Segment[], maxChars: number): Segment[] {
+    const out: Segment[] = [];
+    let used = 0;
+    for (let i = all.length - 1; i >= 0; i--) {
+      const size = formatSegmentLine(all[i], this.speakers).length + 1;
+      if (out.length && used + size > maxChars) break;
+      used += size;
+      out.push(all[i]);
+    }
+    return out.reverse();
+  }
+
+  private seedBlock(summary: string | null, maxTranscriptChars: number): { text: string; carried: Segment[]; dropped: number } {
+    const all = this.allFinals();
+    const carried = this.tail(all, Math.max(0, maxTranscriptChars));
+    const dropped = all.length - carried.length;
+    const text = carryoverBlock({
+      summary: summary?.trim() || null,
+      transcript: formatTranscript(carried, this.speakers),
+      dropped: dropped > 0,
+      namesLine: namesMapLine(this.speakers),
+    });
+    return { text, carried, dropped };
+  }
+
+  /**
+   * Starts a new log because the old one is getting too long for the context window. The new
+   * log opens like the old one (frozen system prompt, context block ◆), then a carry-over block
+   * ◆: the latest rolling summary and the newest transcript lines that fit `maxTranscriptChars`,
+   * rendered with current names, plus the names map. Every final seen so far is either in that
+   * tail or older than it (the summary covers those), so nothing stays pending; lines arriving
+   * later go out with the next turn as usual. The name state restarts from the current names.
+   */
+  rollover(opts: { summary: string | null; maxTranscriptChars: number }): RolloverInfo {
+    if (this.awaitingReply) throw new Error("cannot roll over while a turn awaits its reply");
+    const { text, carried, dropped } = this.seedBlock(opts.summary, opts.maxTranscriptChars);
+    const names = new Map<string, string>();
+    for (const label of this.names.keys()) names.set(label, this.speakers.nameOf(label));
+    for (const seg of carried) {
+      const label = this.speakers.labelOf(seg);
+      if (label) names.set(label, this.speakers.nameOf(label));
+    }
+    this.turns.length = 0;
+    this.pending = [];
+    this.names = names;
+    this.carryover = text;
+    this.epochs++;
+    return { epoch: this.epochs, carriedLines: carried.length, droppedLines: dropped, summary: !!opts.summary?.trim() };
   }
 
   /** True while a live turn is waiting for its reply. */
@@ -191,10 +296,18 @@ export class Conversation {
   /**
    * Separate request over the full transcript (final summary), rendered with the current
    * names and labels. Shares the frozen system prompt and context block; the breakpoint
-   * sits after the transcript so a regenerate of the summary reads it back.
+   * sits after the transcript so a regenerate of the summary reads it back. When the whole
+   * request would pass `maxChars`, the transcript is replaced by the rolling summary plus the
+   * newest lines that fit (the same seed a rollover uses).
    */
-  finalRequest(taskText: string): RequestPayload {
-    const transcript = fullTranscriptBlock(formatTranscript(this.allFinals(), this.speakers));
+  finalRequest(taskText: string, opts: { maxChars?: number; summary?: string | null } = {}): RequestPayload {
+    let transcript = fullTranscriptBlock(formatTranscript(this.allFinals(), this.speakers));
+    const fixed = this.systemBlocks.join("").length + this.contextBlock.length + taskText.length;
+    if (opts.maxChars !== undefined && fixed + transcript.length > opts.maxChars) {
+      const summary = opts.summary?.trim() || null;
+      const room = opts.maxChars - fixed - (summary?.length ?? 0) - 1_000;
+      transcript = this.seedBlock(summary, room).text;
+    }
     return {
       system: this.renderSystem(),
       messages: [
@@ -226,6 +339,9 @@ export class Conversation {
       const texts = turn.role === "user" ? turn.blocks : [turn.text];
       const content: TextBlock[] = texts.map((text) => ({ type: "text", text }));
       if (i === 0) {
+        // After a rollover the epoch's seed follows the context, with its own breakpoint: it is
+        // fixed for the epoch, and the rolling-summary fork reads it back.
+        if (this.carryover) content.unshift({ type: "text", text: this.carryover, cache_control: EPHEMERAL });
         content.unshift({ type: "text", text: this.contextBlock, cache_control: EPHEMERAL });
       }
       if (i === movingIndex) {

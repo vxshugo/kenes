@@ -19,6 +19,7 @@ call ┘   (kenes-audio)   (kenes-stt)     └─► SQLite (kenes-core)
 | `crates/kenes-types` | Shared types and the UI event wire format |
 | `crates/kenes-audio` | Mic + system audio capture (Linux: PipeWire/Pulse via `parec`; macOS: Core Audio) and `kenes-rec` |
 | `crates/kenes-stt` | Model download, Silero VAD, local recognizer (sherpa-onnx), `kenes-transcribe` |
+| `crates/kenes-aec` | Removes the call's echo from the mic when you use speakers (WebRTC AEC3, pure Rust) |
 | `crates/kenes-core` | Session pipeline, SQLite storage, settings, `kenes-cli` |
 | `app/` | Tauri 2 app: `src-tauri/` (Rust shell), `src/` (React UI + Claude layer in `src/llm`) |
 | `bench/` | ASR benchmark for Russian/Kazakh models |

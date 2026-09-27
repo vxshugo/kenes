@@ -1,8 +1,8 @@
 import { useMemo, useState, type RefObject } from "react";
-import { SHORTCUTS } from "../lib/keys";
+import { formatAccelerator, SHORTCUTS } from "../lib/keys";
 import { speakerClass, speakerStats } from "../llm/speakers";
 import { unnamedLabels } from "../llm/suggestions";
-import type { ControllerState } from "../session/controller";
+import { canAct, type ControllerState } from "../session/controller";
 import { controller } from "../session/useController";
 import { HintCard } from "./HintCard";
 import { IconBook, IconChevron, IconClock, IconSend, IconSpark, IconTranslate, IconWand } from "./Icons";
@@ -95,9 +95,6 @@ type Props = {
   onExplain: () => void;
 };
 
-export function canAct(state: ControllerState): boolean {
-  return ["loading", "running", "stopping", "stopped"].includes(state.phase) || (state.phase === "error" && state.finals.length > 0);
-}
 
 function autoHintNote(state: ControllerState): string {
   const mode = state.settings.autoHintMode;
@@ -145,6 +142,13 @@ function Hints({ state }: { state: ControllerState }) {
 
 export function LiveTab({ state, askRef, question, setQuestion, onExplain }: Props) {
   const enabled = canAct(state);
+  // The system-wide variant, when it is active: the system's own description on the portal.
+  const globalKey = (a: "hint" | "recap") => {
+    const st = state.hotkeys;
+    if (!st || st.state !== "active") return "";
+    const trigger = st.backend === "portal" ? st.bindings.find((b) => b.action === a)?.trigger : formatAccelerator(state.settings.hotkeys[a]);
+    return trigger ? `; из любого окна: ${trigger}` : "";
+  };
   const speakers = useSpeakerDirectory(state.micMode, state.speakerNames);
   const empty =
     state.phase === "loading"
@@ -174,10 +178,10 @@ export function LiveTab({ state, askRef, question, setQuestion, onExplain }: Pro
       />
       <div className="actions">
         <div className="action-row">
-          <button className="btn btn-primary btn-hint" disabled={!enabled} onClick={() => controller.hint()} title={`Подсказать ответ на последний вопрос (${SHORTCUTS.hint})`}>
+          <button className="btn btn-primary btn-hint" disabled={!enabled} onClick={() => controller.hint()} title={`Подсказать ответ на последний вопрос (${SHORTCUTS.hint}${globalKey("hint")})`}>
             <IconSpark /> Что ответить?
           </button>
-          <button className="btn" disabled={!enabled} onClick={() => controller.recap(5)} title={`Что обсуждали за последние 5 минут (${SHORTCUTS.recap})`}>
+          <button className="btn" disabled={!enabled} onClick={() => controller.recap(5)} title={`Что обсуждали за последние 5 минут (${SHORTCUTS.recap}${globalKey("recap")})`}>
             <IconClock /> Кратко: 5 мин
           </button>
           <button className="btn" disabled={!enabled} onClick={() => controller.translate()} title={`Перевести казахские реплики на русский (${SHORTCUTS.translate})`}>

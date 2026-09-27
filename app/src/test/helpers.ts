@@ -47,13 +47,16 @@ export function taskOf(r: CapturedRequest): string {
  * Stand-in for `client.beta.messages.stream()`: `reply(params)` decides the text, which is
  * streamed as a couple of deltas before `finalMessage()` resolves.
  */
-export function fakeClaude(reply: (req: CapturedRequest) => string) {
+export type FakeUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
+
+export function fakeClaude(reply: (req: CapturedRequest) => string, usage?: (req: CapturedRequest, index: number) => Partial<FakeUsage>) {
   const calls: CapturedRequest[] = [];
   const client = {
     beta: {
       messages: {
         stream(params: CapturedRequest) {
           calls.push(params);
+          const index = calls.length - 1;
           const text = reply(params);
           const handlers: Array<(d: string) => void> = [];
           return {
@@ -70,7 +73,7 @@ export function fakeClaude(reply: (req: CapturedRequest) => string) {
                 stop_reason: "end_turn",
                 stop_details: null,
                 content: [{ type: "text", text }],
-                usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+                usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...usage?.(params, index) },
               };
             },
           };

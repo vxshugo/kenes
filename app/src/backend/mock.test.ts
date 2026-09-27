@@ -3,7 +3,7 @@ import { findName, looksLikeQuestion, SILENCE_WAIT_MS } from "../llm/triggers";
 import { applyRelabel } from "../llm/speakers";
 import { MemoryStorage, waitFor } from "../test/helpers";
 import type { PipelineEvent, Segment, Settings } from "../types";
-import { MOCK_DEFAULT_SETTINGS, MockBackend, MockDiarizer } from "./mock";
+import { LIVE_STALE_MS, MOCK_DEFAULT_SETTINGS, MockBackend, MockDiarizer } from "./mock";
 import { MOCK_PEOPLE, MOCK_SCRIPT, type ScriptLine } from "./mockScript";
 
 beforeEach(() => {
@@ -159,3 +159,59 @@ describe("MockBackend: speaker names and voiceprint", () => {
     ]);
   });
 });
+
+describe("MockBackend: a running meeting survives a page reload", () => {
+  const SCRIPT: ScriptLine[] = [
+    { who: "aigerim", pause: 10, text: "коллеги начнем" },
+    { who: "aidos", pause: 10, text: "по мобилке всё по плану" },
+    { who: "erlan", pause: 10, text: "релиз в пятницу" },
+    { who: "dina", pause: 10, text: "тесты готовы" },
+  ];
+
+  it("session_status reattaches: the script continues where it was, with the same labels and ids", async () => {
+    const first = new MockBackend({ speed: 50, script: SCRIPT });
+    await first.saveSettings({ ...MOCK_DEFAULT_SETTINGS, rollingSummaryMinutes: 0 });
+    expect(await first.sessionStatus()).toBeNull();
+    const { meetingId } = await first.startSession("Синк", "");
+    await waitForStored(first, meetingId, 2);
+    first.detach(); // the page reloads; the "Rust side" keeps the meeting
+
+    const second = new MockBackend({ speed: 50, script: SCRIPT });
+    const events: PipelineEvent[] = [];
+    await second.onEvent((e) => events.push(e));
+    const live = await second.sessionStatus();
+    expect(live).toEqual({ meetingId, state: "running" });
+    await waitForStored(second, meetingId, SCRIPT.length);
+    const stored = await second.getMeeting(meetingId);
+    expect(stored.segments.map((s) => s.text)).toEqual(SCRIPT.map((l) => l.text));
+    expect(new Set(stored.segments.map((s) => s.id)).size).toBe(SCRIPT.length);
+    expect(stored.segments.map((s) => s.speaker)).toEqual(["sys:1", "sys:2", "sys:3", "sys:4"]);
+    // Timestamps keep counting from the original start.
+    expect(stored.segments[3].startMs).toBeGreaterThan(stored.segments[1].startMs);
+    expect(events.some((e) => e.type === "status" && e.state === "running")).toBe(true);
+    await expect(second.startSession("again", "")).rejects.toThrow(/уже идёт/);
+    await second.stopSession();
+    expect(await second.sessionStatus()).toBeNull();
+    expect((await second.getMeeting(meetingId)).endedAt).not.toBeNull();
+  });
+
+  it("a live record without a heartbeat (the tab was closed) ends that meeting instead", async () => {
+    const first = new MockBackend({ speed: 50, script: SCRIPT });
+    const { meetingId } = await first.startSession("Синк", "");
+    first.detach();
+    const rec = JSON.parse(localStorage.getItem("kenes.mock.live")!);
+    localStorage.setItem("kenes.mock.live", JSON.stringify({ ...rec, beat: Date.now() - LIVE_STALE_MS - 1 }));
+    const second = new MockBackend({ speed: 50, script: SCRIPT });
+    expect(await second.sessionStatus()).toBeNull();
+    expect((await second.getMeeting(meetingId)).endedAt).not.toBeNull();
+    expect(localStorage.getItem("kenes.mock.live")).toBeNull();
+  });
+});
+
+async function waitForStored(backend: MockBackend, meetingId: string, count: number) {
+  const start = Date.now();
+  while ((await backend.getMeeting(meetingId)).segments.length < count) {
+    if (Date.now() - start > 10_000) throw new Error(`timed out waiting for ${count} stored segments`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}

@@ -1,12 +1,14 @@
-//! Tauri shell over `kenes-core`. Commands and the `kenes://event` payload are
-//! specified in `docs/CONTRACT.md`.
+//! Tauri shell over `kenes-core`. Commands and the `kenes://event` / `kenes://hotkey`
+//! payloads are specified in `docs/CONTRACT.md`.
 
+mod hotkeys;
+mod platform;
 mod secrets;
 
 use std::sync::Arc;
 
 use kenes_core::diarize::{self, VoiceprintStatus};
-use kenes_core::{default_data_dir, settings, Meeting, MeetingSummary, SessionManager, Store};
+use kenes_core::{default_data_dir, settings, LiveSession, Meeting, MeetingSummary, SessionManager, Store};
 use kenes_types::DeviceInfo;
 use serde::Serialize;
 use serde_json::Value;
@@ -14,6 +16,8 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
+use hotkeys::{HotkeyConfig, HotkeyStatus, Hotkeys};
+use platform::PlatformInfo;
 use secrets::Secrets;
 
 const EVENT: &str = "kenes://event";
@@ -22,6 +26,8 @@ struct AppState {
     store: Arc<Store>,
     sessions: SessionManager,
     secrets: Secrets,
+    /// The window runs under XWayland (`gnomeAlwaysOnTop`); fixed for the process.
+    x11_forced: bool,
 }
 
 type CmdResult<T> = Result<T, String>;
@@ -57,6 +63,12 @@ async fn start_session(state: State<'_, AppState>, title: String, context: Strin
     let title = if title.trim().is_empty() { "Встреча".to_owned() } else { title };
     let meeting_id = state.sessions.start(&title, &context, core).map_err(err)?;
     Ok(Started { meeting_id })
+}
+
+/// The running session, if any, for a UI that (re)loads mid-meeting.
+#[tauri::command]
+async fn session_status(app: AppHandle) -> CmdResult<Option<LiveSession>> {
+    blocking(move || Ok(app.state::<AppState>().sessions.live())).await
 }
 
 #[tauri::command]
@@ -150,6 +162,24 @@ async fn clear_voiceprint(state: State<'_, AppState>) -> CmdResult<()> {
     diarize::clear_voiceprint(&state.store).map_err(err)
 }
 
+/// Applies the global-shortcut settings; resolves once the system has answered (the portal
+/// may first show its own dialog).
+#[tauri::command]
+async fn configure_hotkeys(app: AppHandle, config: HotkeyConfig) -> CmdResult<HotkeyStatus> {
+    let hotkeys = app.state::<Hotkeys>();
+    Ok(hotkeys.configure(&app, config).await)
+}
+
+#[tauri::command]
+async fn hotkey_status(hotkeys: State<'_, Hotkeys>) -> CmdResult<HotkeyStatus> {
+    Ok(hotkeys.status())
+}
+
+#[tauri::command]
+async fn platform_info(state: State<'_, AppState>, hotkeys: State<'_, Hotkeys>) -> CmdResult<PlatformInfo> {
+    Ok(platform::info(state.x11_forced, hotkeys.backend))
+}
+
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle", "Показать / скрыть", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Выйти", true, None::<&str>)?;
@@ -181,11 +211,26 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            let data_dir = default_data_dir();
-            let store = Arc::new(Store::open(&data_dir.join("kenes.db"))?);
+    // Settings that must be read before GTK starts (the display backend).
+    let data_dir = default_data_dir();
+    let store = Store::open(&data_dir.join("kenes.db")).map(Arc::new);
+    let stored = store.as_ref().ok().and_then(|s| settings::load(s).ok()).unwrap_or(serde_json::Value::Null);
+    let x11_forced = platform::apply(&stored);
+    if x11_forced {
+        log::info!("GNOME on Wayland: running under XWayland so the window can stay on top (gnomeAlwaysOnTop)");
+    }
+
+    let hotkeys = Hotkeys::new(hotkeys::detect_backend());
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    #[cfg(desktop)]
+    if hotkeys.backend == hotkeys::BackendKind::Plugin {
+        builder = builder.plugin(hotkeys.plugin());
+    }
+
+    let app = builder
+        .manage(hotkeys)
+        .setup(move |app| {
+            let store = store?;
             let handle = app.handle().clone();
             let sink: kenes_core::EventSink = Arc::new(move |ev| {
                 if let Err(e) = handle.emit(EVENT, &ev) {
@@ -193,7 +238,7 @@ pub fn run() {
                 }
             });
             let sessions = SessionManager::new(store.clone(), kenes_stt::models_dir(), sink);
-            app.manage(AppState { store, sessions, secrets: Secrets::new(&data_dir) });
+            app.manage(AppState { store, sessions, secrets: Secrets::new(&data_dir), x11_forced });
             if let Err(e) = setup_tray(app) {
                 // Some Linux desktops have no tray; the window still works.
                 log::warn!("tray unavailable: {e}");
@@ -205,6 +250,7 @@ pub fn run() {
             list_models,
             start_session,
             stop_session,
+            session_status,
             get_settings,
             save_settings,
             get_api_key,
@@ -217,6 +263,9 @@ pub fn run() {
             enroll_voice,
             voiceprint_status,
             clear_voiceprint,
+            configure_hotkeys,
+            hotkey_status,
+            platform_info,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -1,7 +1,8 @@
 //! Local speech recognition for kenes: model registry and download, Silero
-//! VAD, an offline sherpa-onnx recognizer (GigaAM CTC), and the streaming
-//! [`Transcriber`] that turns [`AudioChunk`]s into partial and final
-//! [`Segment`]s. See `docs/CONTRACT.md` and this crate's README.
+//! VAD, an offline GigaAM CTC recognizer (on ONNX Runtime with GigaAM's own
+//! front-end, or through sherpa-onnx), and the streaming [`Transcriber`] that
+//! turns [`AudioChunk`]s into partial and final [`Segment`]s. See
+//! `docs/CONTRACT.md` and this crate's README.
 //!
 //! ```no_run
 //! use kenes_stt::{ensure_model, SttConfig, Transcriber};
@@ -19,6 +20,7 @@
 //! ```
 
 mod engine;
+mod gigaam;
 mod registry;
 mod segmenter;
 mod splitter;
@@ -31,11 +33,13 @@ use anyhow::{bail, Result};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use kenes_types::{AudioChunk, Segment, Source, SAMPLE_RATE};
 
-use engine::{Recognizer, SherpaRecognizer, SileroVad};
+use engine::{load_recognizer, Recognizer, SileroVad};
 use registry::ModelKind;
 use segmenter::{ms_to_samples, Closed, Segmenter, SegmenterConfig, Vad};
 use splitter::{plan_pieces, SplitResult, SplitterHandle};
 
+pub use engine::{SttBackend, BACKEND_ENV};
+pub use gigaam::{LogMel, HOP, N_FFT, N_MELS};
 pub use splitter::{SplitOptions, Splitter};
 
 pub use registry::{
@@ -76,6 +80,8 @@ impl Default for SttConfig {
 /// use [`transcribe_buffer`](Transcriber::transcribe_buffer).
 pub struct Transcriber {
     recognizer: Box<dyn Recognizer>,
+    /// The backend actually in use (never `Auto`).
+    backend: SttBackend,
     /// Index 0: mic, 1: system.
     segs: [Segmenter<Box<dyn Vad>>; 2],
     policy: PartialPolicy,
@@ -96,8 +102,18 @@ fn slot(source: Source) -> usize {
 
 impl Transcriber {
     /// Load the recognizer and two VADs. The model must already be on disk
-    /// (see [`ensure_model`]).
+    /// (see [`ensure_model`]). Same as [`with_backend`](Self::with_backend)
+    /// with [`SttBackend::Auto`].
     pub fn new(cfg: SttConfig) -> Result<Self> {
+        Self::with_backend(cfg, SttBackend::Auto)
+    }
+
+    /// Like [`new`](Self::new), choosing the recognizer engine. `Auto` means
+    /// `$KENES_STT_BACKEND` if set, else the model's preferred backend (ONNX
+    /// Runtime for every GigaAM model). If the ONNX Runtime backend can't load
+    /// the model, sherpa-onnx is used instead and a warning is logged; see
+    /// [`backend`](Self::backend) for what was picked.
+    pub fn with_backend(cfg: SttConfig, backend: SttBackend) -> Result<Self> {
         let Some(spec) = registry::spec(&cfg.model_id) else {
             bail!("unknown model {:?}", cfg.model_id);
         };
@@ -105,21 +121,26 @@ impl Transcriber {
             bail!("{} is not a speech recognition model", cfg.model_id);
         }
         let t0 = Instant::now();
-        let recognizer =
-            SherpaRecognizer::new(spec, &model_path(spec.id, &cfg.models_dir), cfg.num_threads)?;
+        let (recognizer, backend) = load_recognizer(
+            spec,
+            &model_path(spec.id, &cfg.models_dir),
+            cfg.num_threads,
+            backend,
+        )?;
         let seg_cfg = SegmenterConfig::new(cfg.max_segment_ms);
         let vad_path = model_path(VAD_MODEL, &cfg.models_dir).join("silero_vad.onnx");
         let mic_vad = SileroVad::new(&vad_path, &seg_cfg.vad)?;
         let sys_vad = SileroVad::new(&vad_path, &seg_cfg.vad)?;
         log::info!(
-            "loaded {} in {:.2} s",
+            "loaded {} ({backend} backend) in {:.2} s",
             cfg.model_id,
             t0.elapsed().as_secs_f32()
         );
         Ok(Self::from_parts(
             &cfg,
             seg_cfg,
-            Box::new(recognizer),
+            recognizer,
+            backend,
             [Box::new(mic_vad), Box::new(sys_vad)],
         ))
     }
@@ -128,10 +149,12 @@ impl Transcriber {
         cfg: &SttConfig,
         seg_cfg: SegmenterConfig,
         recognizer: Box<dyn Recognizer>,
+        backend: SttBackend,
         [mic_vad, sys_vad]: [Box<dyn Vad>; 2],
     ) -> Self {
         Transcriber {
             recognizer,
+            backend,
             segs: [
                 Segmenter::new(Source::Mic, seg_cfg.clone(), mic_vad),
                 Segmenter::new(Source::System, seg_cfg, sys_vad),
@@ -214,6 +237,20 @@ impl Transcriber {
     /// output, for benchmarks and tests.
     pub fn recognize(&mut self, samples: &[f32]) -> Result<String> {
         self.recognizer.recognize(samples)
+    }
+
+    /// Like [`recognize`](Self::recognize) but without the 0.3 s of trailing
+    /// silence every decode normally gets. Only for comparing with reference
+    /// implementations that don't pad.
+    #[doc(hidden)]
+    pub fn recognize_unpadded(&mut self, samples: &[f32]) -> Result<String> {
+        self.recognizer.decode(samples)
+    }
+
+    /// The recognizer engine in use: [`SttBackend::Ort`] or
+    /// [`SttBackend::Sherpa`], never `Auto`.
+    pub fn backend(&self) -> SttBackend {
+        self.backend
     }
 
     fn run(mut self, rx: Receiver<AudioChunk>, tx: Sender<Segment>) {
@@ -558,11 +595,16 @@ mod tests {
     }
 
     impl Recognizer for FakeRecognizer {
+        fn decode(&mut self, samples: &[f32]) -> Result<String> {
+            let loud = samples.iter().filter(|x| x.abs() > 0.1).count();
+            Ok(vec!["сөз"; loud / 1600].join(" "))
+        }
+
+        // Records the unpadded length of every utterance it is asked for.
         fn recognize(&mut self, samples: &[f32]) -> Result<String> {
             self.calls.lock().unwrap().push(samples.len());
             std::thread::sleep(self.delay);
-            let loud = samples.iter().filter(|x| x.abs() > 0.1).count();
-            Ok(vec!["сөз"; loud / 1600].join(" "))
+            self.decode(samples)
         }
     }
 
@@ -583,7 +625,7 @@ mod tests {
             Box::new(FakeVad::new(&seg_cfg.vad)),
         ];
         (
-            Transcriber::from_parts(&cfg, seg_cfg, Box::new(rec), vads),
+            Transcriber::from_parts(&cfg, seg_cfg, Box::new(rec), SttBackend::Sherpa, vads),
             calls,
         )
     }

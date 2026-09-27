@@ -2,6 +2,10 @@ import { DEFAULT_SETTINGS, normalizeSettings } from "../types";
 import type {
   DeviceInfo,
   EnrollResult,
+  HotkeyAction,
+  HotkeyConfig,
+  HotkeyStatus,
+  LiveSession,
   Meeting,
   MeetingSummary,
   ModelInfo,
@@ -22,6 +26,11 @@ const LS_SETTINGS = "kenes.mock.settings";
 const LS_MEETINGS = "kenes.mock.meetings";
 const LS_API_KEY = "kenes.mock.apiKey";
 const LS_VOICEPRINT = "kenes.mock.voiceprint";
+/** The running session, so a reloaded page can reattach (the Rust side outlives the webview). */
+const LS_LIVE = "kenes.mock.live";
+/** A live record without a heartbeat for this long belongs to a closed tab: that meeting ended. */
+export const LIVE_STALE_MS = 30_000;
+const BEAT_MS = 1_000;
 
 /** Mock-only defaults: the scripted meeting addresses the user as «Хуго». */
 export const MOCK_DEFAULT_SETTINGS: Settings = { ...DEFAULT_SETTINGS, myNames: ["Хуго"] };
@@ -98,6 +107,12 @@ export function speakersOf(segments: readonly Segment[], names: Record<string, s
  * first appearance, never reused. Unsure lines get null, stray lines a spurious new label;
  * `recluster()` resolves both at the end of the meeting.
  */
+export type DiarizerSnapshot = {
+  labels: Array<[string, string]>;
+  counters: { sys: number; mic: number };
+  corrections: Array<[string, string]>;
+};
+
 export class MockDiarizer {
   private readonly labels = new Map<string, string>();
   private readonly counters = { sys: 0, mic: 0 };
@@ -107,7 +122,19 @@ export class MockDiarizer {
   constructor(
     private readonly micMode: Settings["micMode"],
     private readonly voiceprint: boolean,
-  ) {}
+    snapshot?: DiarizerSnapshot,
+  ) {
+    if (snapshot) {
+      for (const [k, v] of snapshot.labels) this.labels.set(k, v);
+      for (const [k, v] of snapshot.corrections) this.corrections.set(k, v);
+      this.counters.sys = snapshot.counters.sys;
+      this.counters.mic = snapshot.counters.mic;
+    }
+  }
+
+  snapshot(): DiarizerSnapshot {
+    return { labels: [...this.labels], counters: { ...this.counters }, corrections: [...this.corrections] };
+  }
 
   private labelFor(person: Person, source: Source): string {
     if (person.me && (this.micMode === "me" || this.voiceprint)) return "me";
@@ -150,16 +177,46 @@ export type MockOptions = {
   people?: Person[];
 };
 
-type Run = { meetingId: string; cancelled: boolean; timers: ReturnType<typeof setInterval>[]; startedAt: number; diarizer: MockDiarizer; emitted: Set<string> };
+type Run = {
+  meetingId: string;
+  cancelled: boolean;
+  timers: ReturnType<typeof setInterval>[];
+  phase: "loading" | "running";
+  /** Date.now() when the meeting clock started (status running); null while loading. */
+  clockStart: number | null;
+  /** Next script line to play. */
+  line: number;
+  settings: Settings;
+  voiceprint: boolean;
+  diarizer: MockDiarizer;
+  emitted: Set<string>;
+};
+
+/** What survives a page reload (localStorage), like the Rust session outlives the webview. */
+type LiveRecord = {
+  meetingId: string;
+  phase: "loading" | "running";
+  clockStart: number | null;
+  line: number;
+  counters: Record<Source, number>;
+  diarizer: DiarizerSnapshot;
+  settings: Settings;
+  voiceprint: boolean;
+  /** Heartbeat (Date.now()), refreshed every second while the page plays the meeting. */
+  beat: number;
+};
 
 /**
  * Browser stand-in for the Rust side: replays a scripted meeting with growing partials,
  * speaker labels, level meters and a fake model-loading phase; re-labels a few segments on
  * stop; keeps meetings, notes, speaker names, settings and the voiceprint in localStorage.
+ * A running meeting survives a page reload: the next page reattaches through
+ * `sessionStatus()` and the script continues where it was.
  */
 export class MockBackend implements Backend {
   readonly kind = "mock" as const;
   private handlers = new Set<(e: PipelineEvent) => void>();
+  private hotkeyHandlers = new Set<(a: HotkeyAction) => void>();
   private run: Run | null = null;
   private enrolling = false;
   private speaking: Record<Source, boolean> = { mic: false, system: false };
@@ -190,6 +247,35 @@ export class MockBackend implements Backend {
     return () => {
       this.handlers.delete(handler);
     };
+  }
+
+  async onHotkey(handler: (action: HotkeyAction) => void) {
+    this.hotkeyHandlers.add(handler);
+    return () => {
+      this.hotkeyHandlers.delete(handler);
+    };
+  }
+
+  async onHotkeyStatus(_handler: (status: HotkeyStatus) => void) {
+    return () => {};
+  }
+
+  /** Dev/test hook: a system-wide shortcut fired, as the desktop shell would report it. */
+  simulateHotkey(action: HotkeyAction) {
+    for (const h of this.hotkeyHandlers) h(action);
+  }
+
+  async configureHotkeys(config: HotkeyConfig): Promise<HotkeyStatus> {
+    return {
+      backend: "none",
+      state: config.enabled ? "unavailable" : "off",
+      bindings: (["hint", "recap", "toggle"] as const).map((action) => ({ action, trigger: null })),
+      message: "В браузере глобальных сочетаний нет — их даёт настольное приложение. Сочетания внутри окна работают.",
+    };
+  }
+
+  async platformInfo() {
+    return { os: "browser", sessionType: null, desktop: null, gnome: false, x11Forced: false, hotkeyBackend: "none" as const };
   }
 
   async listDevices() {
@@ -269,6 +355,7 @@ export class MockBackend implements Backend {
   }
 
   async deleteMeeting(id: string) {
+    await this.sessionStatus();
     if (this.run?.meetingId === id) throw new Error("нельзя удалить идущую встречу");
     this.saveMeetings(this.meetings().filter((m) => m.id !== id));
   }
@@ -290,6 +377,7 @@ export class MockBackend implements Backend {
   }
 
   async enrollVoice(seconds: number): Promise<EnrollResult> {
+    await this.sessionStatus();
     if (this.run) throw new Error("Нельзя записывать образец голоса во время встречи.");
     if (this.enrolling) throw new Error("Запись образца уже идёт.");
     this.enrolling = true;
@@ -314,6 +402,7 @@ export class MockBackend implements Backend {
   }
 
   async startSession(title: string, context: string) {
+    await this.sessionStatus();
     if (this.run) throw new Error("сессия уже идёт");
     if (this.enrolling) throw new Error("идёт запись образца голоса");
     const settings = await this.getSettings();
@@ -330,27 +419,106 @@ export class MockBackend implements Backend {
     };
     this.saveMeetings([...this.meetings(), meeting]);
     this.counters = { mic: 0, system: 0 };
-    this.open = {};
-    this.openLine = {};
-    this.speaking = { mic: false, system: false };
     const run: Run = {
       meetingId: meeting.id,
       cancelled: false,
       timers: [],
-      startedAt: 0,
+      phase: "loading",
+      clockStart: null,
+      line: 0,
+      settings,
+      voiceprint,
       diarizer: new MockDiarizer(settings.micMode, voiceprint),
       emitted: new Set(),
     };
-    this.run = run;
-    void this.play(run, settings);
+    this.launch(run);
     return { meetingId: meeting.id };
   }
 
-  async stopSession() {
+  /** The running meeting, resuming one a previous page left running (like the Rust side outliving a webview). */
+  async sessionStatus(): Promise<LiveSession | null> {
+    if (!this.run) {
+      const rec = readJson<LiveRecord | null>(LS_LIVE, null);
+      if (!rec) return null;
+      if (Date.now() - rec.beat > LIVE_STALE_MS) {
+        // The tab that ran it is gone, like the app quitting: the meeting ended then.
+        this.updateMeeting(rec.meetingId, (m) => {
+          m.endedAt ??= new Date(rec.beat).toISOString();
+        });
+        this.clearLive();
+        return null;
+      }
+      this.counters = { ...rec.counters };
+      const emitted = new Set(this.meetings().find((m) => m.id === rec.meetingId)?.segments.map((s) => s.id) ?? []);
+      this.launch({
+        meetingId: rec.meetingId,
+        cancelled: false,
+        timers: [],
+        phase: rec.phase,
+        clockStart: rec.clockStart,
+        line: rec.line,
+        settings: normalizeSettings(rec.settings),
+        voiceprint: rec.voiceprint,
+        diarizer: new MockDiarizer(rec.settings.micMode, rec.voiceprint, rec.diarizer),
+        emitted,
+      });
+    }
+    const run = this.run!;
+    return { meetingId: run.meetingId, state: run.phase };
+  }
+
+  /** Test hook: the page goes away (reload) while the meeting keeps running "on the Rust side". */
+  detach() {
     const run = this.run;
     if (!run) return;
     run.cancelled = true;
     run.timers.forEach((t) => clearInterval(t));
+    this.run = null;
+    this.handlers.clear();
+    this.hotkeyHandlers.clear();
+  }
+
+  private launch(run: Run) {
+    this.open = {};
+    this.openLine = {};
+    this.speaking = { mic: false, system: false };
+    this.run = run;
+    this.persist(run);
+    run.timers.push(setInterval(() => this.persist(run), BEAT_MS));
+    void this.play(run);
+  }
+
+  private persist(run: Run) {
+    if (run.cancelled) return;
+    const rec: LiveRecord = {
+      meetingId: run.meetingId,
+      phase: run.phase,
+      clockStart: run.clockStart,
+      line: run.line,
+      counters: { ...this.counters },
+      diarizer: run.diarizer.snapshot(),
+      settings: run.settings,
+      voiceprint: run.voiceprint,
+      beat: Date.now(),
+    };
+    writeJson(LS_LIVE, rec);
+  }
+
+  private clearLive() {
+    try {
+      localStorage.removeItem(LS_LIVE);
+    } catch {
+      // ignore
+    }
+  }
+
+  async stopSession() {
+    await this.sessionStatus();
+    const run = this.run;
+    if (!run) return;
+    run.cancelled = true;
+    run.timers.forEach((t) => clearInterval(t));
+    this.clearLive();
     // Like the Rust side: close whatever utterance is still open…
     for (const src of ["mic", "system"] as Source[]) {
       const seg = this.open[src];
@@ -385,7 +553,7 @@ export class MockBackend implements Backend {
   }
 
   private now(run: Run) {
-    return run.startedAt ? Math.round((performance.now() - run.startedAt) * this.speed) : 0;
+    return run.clockStart ? Math.round((Date.now() - run.clockStart) * this.speed) : 0;
   }
 
   /** Where a line is heard in this meeting format, or null if that source isn't captured. */
@@ -400,16 +568,21 @@ export class MockBackend implements Backend {
     return source;
   }
 
-  private async play(run: Run, settings: Settings) {
-    // Fake model loading phase.
-    this.emit({ type: "status", state: "loading", message: "Загрузка модели распознавания…" });
-    for (let i = 0; i <= 10; i++) {
+  private async play(run: Run) {
+    const settings = run.settings;
+    if (run.phase === "loading") {
+      // Fake model loading phase.
+      this.emit({ type: "status", state: "loading", message: "Загрузка модели распознавания…" });
+      for (let i = 0; i <= 10; i++) {
+        if (run.cancelled) return;
+        this.emit({ type: "modelProgress", model: settings.sttModel, progress: i / 10 });
+        await this.wait(220);
+      }
       if (run.cancelled) return;
-      this.emit({ type: "modelProgress", model: settings.sttModel, progress: i / 10 });
-      await this.wait(220);
+      run.phase = "running";
+      run.clockStart = Date.now();
+      this.persist(run);
     }
-    if (run.cancelled) return;
-    run.startedAt = performance.now();
     this.emit({ type: "status", state: "running", message: null });
 
     const levels = setInterval(() => {
@@ -423,14 +596,17 @@ export class MockBackend implements Backend {
     }, 100);
     run.timers.push(levels);
 
-    for (const line of this.script) {
+    for (let index = run.line; index < this.script.length; index++) {
+      const line = this.script[index];
       if (run.cancelled) return;
       await this.wait(line.pause);
       if (run.cancelled) return;
       const person = this.people.get(line.who);
-      if (!person) continue;
-      const source = this.sourceFor(person, settings);
-      if (!source) continue;
+      const source = person ? this.sourceFor(person, settings) : null;
+      if (!person || !source) {
+        run.line = index + 1;
+        continue;
+      }
       const id = `${source}-${++this.counters[source]}`;
       const words = line.text.split(" ");
       const startMs = this.now(run);
@@ -450,6 +626,8 @@ export class MockBackend implements Backend {
       if (run.cancelled) return;
       const seg = this.open[source];
       if (seg) this.finalize(run, { ...seg, text: line.text, speaker: run.diarizer.assign(id, person, source, line) });
+      run.line = index + 1;
+      this.persist(run);
     }
   }
 }

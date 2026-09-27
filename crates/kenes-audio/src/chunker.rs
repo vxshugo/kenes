@@ -113,6 +113,12 @@ impl Chunker {
         }
         let jump = *min_lag;
         self.gap = None;
+        // Complete the partial chunk with silence from the lost span (always longer than a
+        // chunk) so only the last chunk of a stream is ever short.
+        let pad = (self.chunk_len - self.pending.len()) % self.chunk_len;
+        if pad as u64 <= jump {
+            self.pending.resize(self.pending.len() + pad, 0.0);
+        }
         self.flush(emit);
         log::warn!(
             "{} stream lost about {} ms of audio; re-syncing timestamps",
@@ -242,6 +248,46 @@ mod tests {
         for w in out.windows(2) {
             assert!(w[1].start_ms >= w[0].start_ms + w[0].duration_ms());
         }
+    }
+
+    #[test]
+    fn gap_resync_keeps_every_chunk_full_length() {
+        // CHUNK_SAMPLES promises 32 ms chunks except the last one flushed on stop.
+        let mut c = Chunker::new(Source::Mic);
+        let mut out = Vec::new();
+        let mut now = 0;
+        // 10 × 20 ms reads: six full chunks plus 128 samples waiting when the gap hits.
+        for _ in 0..10 {
+            now += 320;
+            collect(&mut c, &[0.25; 320], now, &mut out);
+        }
+        now += 3 * RATE;
+        for _ in 0..100 {
+            now += 320;
+            collect(&mut c, &[0.25; 320], now, &mut out);
+        }
+        c.flush(&mut |ch| out.push(ch));
+        let (_, all_but_last) = out.split_last().unwrap();
+        for (i, ch) in all_but_last.iter().enumerate() {
+            assert_eq!(
+                ch.samples.len(),
+                CHUNK_SAMPLES,
+                "chunk {i} at {} ms",
+                ch.start_ms
+            );
+        }
+        // Every captured sample is delivered exactly once, and chunks never overlap.
+        let real = out
+            .iter()
+            .flat_map(|c| &c.samples)
+            .filter(|&&s| s == 0.25)
+            .count();
+        assert_eq!(real, 110 * 320);
+        for w in out.windows(2) {
+            assert!(w[1].start_ms >= w[0].start_ms + w[0].duration_ms());
+        }
+        let last = out.last().unwrap();
+        assert!(samples_to_ms(now).abs_diff(last.start_ms + last.duration_ms()) <= 1);
     }
 
     #[test]

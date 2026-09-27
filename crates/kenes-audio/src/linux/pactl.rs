@@ -1,6 +1,8 @@
 //! Device discovery through `pactl` (works against PulseAudio and pipewire-pulse).
 
+use std::io::Read;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use kenes_types::{DeviceInfo, DeviceKind};
@@ -14,15 +16,49 @@ pub(crate) struct PaSource {
     pub is_monitor: bool,
 }
 
+/// A wedged sound server must not hang device listing or capture start.
+const PACTL_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Runs `pactl` with a C/UTF-8 locale: localized decimal commas break its JSON
 /// output, and localized labels would break `pactl info` parsing.
 fn run(args: &[&str]) -> Result<String> {
-    let out = Command::new("pactl")
+    let mut child = Command::new("pactl")
         .args(args)
         .env("LC_ALL", "C.UTF-8")
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("running pactl (is pulseaudio-utils installed?)")?;
+    // Drain both pipes on threads so a chatty pactl can't block on a full pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + PACTL_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("`pactl {}` did not answer within {PACTL_TIMEOUT:?}; is the sound server hung?", args.join(" "));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let out = std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    };
     if !out.status.success() {
         bail!(
             "`pactl {}` failed ({}): {}",

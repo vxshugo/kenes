@@ -7,14 +7,59 @@ how it performs.
 
 ## Engine
 
-The engine is the official [`sherpa-onnx`](https://crates.io/crates/sherpa-onnx) Rust crate,
-pinned to `=1.13.8`. The pin is exact because the segmenter mirrors that version's VAD internals.
-Its build script downloads a prebuilt static library (22 MB `.tar.bz2`, 135 MB unpacked, cached in
-`target/sherpa-onnx-prebuilt/`) for linux x64/aarch64 and macOS arm64/x64. You don't need cmake or
-clang, only the system C++ runtime (libstdc++ on Linux, libc++ on macOS). Two environment variables
-change where the library comes from:
+Two recognizer backends run the same int8 GigaAM ONNX files. `SttBackend::Auto` (the default)
+picks ONNX Runtime for every model in the registry:
 
-- `SHERPA_ONNX_LIB_DIR` points at libraries you already have.
+- **`ort`: ONNX Runtime with GigaAM's own front-end** (`src/gigaam.rs`). GigaAM-v3 and
+  GigaAM-Multilingual were trained on torchaudio's log-mel with a 20 ms window (n_fft = win =
+  320, hop 160, no centre padding, periodic Hann, power spectrum, 64 HTK mel bins over 0–8000 Hz,
+  `ln(clamp(x, 1e-9, 1e9))`). `LogMel` computes exactly that (`realfft`, in `f64`), the model runs
+  through the [`ort`](https://crates.io/crates/ort) crate, and the output is decoded with greedy
+  CTC (blank = `<blk>`, id 0 = space). The inputs and outputs are checked when the model loads.
+  `encoded_lengths` is used if present; the v3 export doesn't have it, and the Multilingual export
+  gives it as `int32`.
+- **`sherpa`: sherpa-onnx's `OfflineRecognizer`**, the official
+  [`sherpa-onnx`](https://crates.io/crates/sherpa-onnx) Rust crate. sherpa-onnx 1.13.8 gives every
+  GigaAM model the v1/v2 front-end (a 25 ms kaldi fbank with n_fft 400), which costs accuracy on
+  code-switched audio (below). It stays as the fallback.
+
+**One ONNX Runtime per process.** sherpa-onnx is still needed for the Silero VAD (here) and the
+speaker embeddings (`kenes-speakers`), and it links its own ONNX Runtime statically (1.28.2 in
+sherpa-onnx 1.13.8, the same version in the Linux and macOS archives). The `ort` crate normally links
+or downloads a second one, which gives duplicate symbols, or two runtimes if it is loaded as a shared
+library. Instead `ort` is built with `default-features = false` and `alternative-backend`, so it
+links nothing. On first use `gigaam::init_ort` calls `OrtGetApiBase()`, which the linker resolves
+against sherpa-onnx-sys's `libonnxruntime.a`, and hands that API table to `ort::set_api`. The
+VAD, the speaker model and both recognizers then share one runtime and one ORT environment. Nothing
+is added to the build, the bundle or the downloads, and it works the same way on Linux and macOS.
+`ort` requests C API version 17, and the runtime provides up to 28. Alternatives that were rejected:
+
+- **`ort` with `load-dynamic` and a pinned `libonnxruntime` downloaded at first run**: a second
+  runtime in the process, next to the static one. It needs a sha256-pinned ~20 MB library per
+  platform (and codesigning on macOS), and a download failure path.
+- **sherpa-onnx's `shared` feature, with `ort` loading the same `libonnxruntime.so`**: one runtime,
+  but `libsherpa-onnx-c-api` and `libonnxruntime` then have to ship next to the binary with an
+  rpath, which means Tauri bundling work. Cargo also unifies the feature for `kenes-speakers`, which
+  keeps the default `static`, and sherpa-onnx-sys refuses `static` and `shared` together.
+
+Guards: if the runtime doesn't provide API 17, or the model's inputs and outputs don't match
+(`features` f32 `[N, 64, T]`, `feature_lengths` i64, `log_probs` f32 `[N, T, vocab]` with the same
+vocabulary size as `tokens.txt`), the ORT backend fails to load. The transcriber then logs a warning
+and uses sherpa-onnx. `ort` releases its environment in a `.fini_array` hook at exit, which for a
+statically linked runtime would run after the runtime's own C++ static destructors. We keep one
+reference to the environment for the life of the process so that release never happens.
+
+Choosing the backend: `Transcriber::with_backend(cfg, backend)`, the `sttBackend` setting (see
+`docs/CONTRACT.md`), or `KENES_STT_BACKEND=ort|sherpa` to override `Auto`. `Transcriber::backend()`
+reports which one is in use. `kenes-transcribe --backend` does the same.
+
+**Build.** The sherpa-onnx build script downloads a prebuilt static library (22 MB `.tar.bz2`, 135 MB
+unpacked, cached in `target/sherpa-onnx-prebuilt/`) for linux x64/aarch64 and macOS arm64/x64. You
+don't need cmake or clang, only the system C++ runtime (libstdc++ on Linux, libc++ on macOS). Two
+environment variables change where the library comes from:
+
+- `SHERPA_ONNX_LIB_DIR` points at libraries you already have. With a shared build, `OrtGetApiBase`
+  then comes from its `libonnxruntime`, which works too.
 - `SHERPA_ONNX_ARCHIVE_DIR` points at a directory holding the archive, for offline builds.
 
 The community `sherpa-rs` crate wasn't needed. The release `kenes-transcribe` binary is 33 MB.
@@ -59,7 +104,8 @@ This is the contract API. Details are in `docs/CONTRACT.md`.
 ```rust
 let cfg = SttConfig::default();                    // default model, 4 threads, 700 ms partials, 20 s max
 ensure_model(&cfg.model_id, &cfg.models_dir, &mut |p| ui_progress(p))?;  // blocking; 0.0..=1.0
-let t = Transcriber::new(cfg)?;                    // loads the model: ~1–2 s
+let t = Transcriber::new(cfg)?;                    // loads the model: ~1–2 s (backend: Auto)
+// or Transcriber::with_backend(cfg, SttBackend::Sherpa)?; t.backend() says which one runs
 let handle = t.spawn(audio_rx, segment_tx);        // one worker thread, both sources
 // …
 drop(audio_tx);                                    // worker flushes open utterances, then exits
@@ -76,6 +122,12 @@ These were added on top of the contract:
   `.part`/resume/hash/rename logic, for crates that ship their own models (`kenes-speakers`). It
   does nothing if `dest` already has that hash.
 - `Transcriber::recognize(samples)` decodes one utterance without the VAD, for benchmarks.
+  (`recognize_unpadded`, hidden from the docs, skips the tail padding, to compare with
+  `bench/run_bench.py`.)
+- `SttBackend` (`Auto`/`Ort`/`Sherpa`, serde `"auto"`/`"ort"`/`"sherpa"`, also `FromStr`),
+  `Transcriber::with_backend(cfg, backend)`, `Transcriber::backend()`, and `BACKEND_ENV`
+  (`"KENES_STT_BACKEND"`). They are in the contract too.
+- `LogMel` with `N_FFT`, `HOP`, `N_MELS`: the GigaAM front-end, for benchmarks and feature checks.
 - `Transcriber::set_splitter(f)` and `set_split_options(SplitOptions)` split finals at speaker
   changes. See below.
 
@@ -263,14 +315,32 @@ With `RUST_LOG=kenes_stt=trace` it prints every VAD transition and cut.
   dropped, the partial budget) and registry integrity and wire shape. Splitter tests use a fake
   splitter: ids and exact cut timestamps, timeline gaps inside a split utterance, merging of tiny
   and out-of-range cuts, an empty first piece after partials (and offline), a panicking
-  splitter, a slow splitter timing out without stalling, and the length threshold.
+  splitter, a slow splitter timing out without stalling, and the length threshold. The GigaAM
+  backend's tests need no model either: frame count, filterbank shape, feature values against
+  the Python formulas (to 1e-4), the log floor for silence and NaN input, `tokens.txt` parsing,
+  greedy CTC, and backend selection (names, `Auto` → env → registry, fallback to sherpa when the
+  ORT load fails, padding).
 - `cargo test -p kenes-stt --release -- --ignored --nocapture` runs the tests with real models and
   audio: script checks for kk and ru, VAD split against whole-clip CER, two sources through the
   live worker at 2× and at full speed, a real download with resume, and a real kk+ru pair with a
   0.2 s gap. The VAD glues that pair into one final, and a gap-finding splitter separates it
-  again at exactly 12.47 s, with 0 % CER on both pieces. Audio comes from
-  `$KENES_STT_TESTDATA`, then `testdata-cache/` (gitignored: a few FLEURS/CV clips, copied from
-  `bench/data/`), then `bench/data/`. Set `KENES_STT_CLIPS=60` for the full comparison above.
+  again at exactly 12.47 s, with 0 % CER on both pieces. These run on the default backend (`ort`).
+  Two more cover the backend itself:
+  - `one_onnx_runtime_for_vad_speakers_and_both_backends` loads the `kenes-speakers` embedder,
+    the ORT recognizer (with its two Silero VADs) and the sherpa recognizer in one process. It
+    uses all of them from three threads at once and checks the outputs don't change, then drops
+    everything and loads again. `kenes-speakers` is a dev-dependency only for this test.
+  - `every_model_runs_on_onnx_runtime` loads all three ASR models on ORT (no fallback allowed) and
+    checks CER plus empty and too-short input.
+
+  Audio comes from `$KENES_STT_TESTDATA`, then `testdata-cache/` (gitignored: a few FLEURS/CV
+  clips, copied from `bench/data/`), then `bench/data/`. Set `KENES_STT_CLIPS=60` for the full
+  comparison above.
+- `examples/bench_sets.rs` runs the benchmark sets (`bench/data`) through either backend and
+  prints WER/CER/RTF. Modes: `whole` (one decode per clip), `unpadded` (same, without the tail
+  padding, like `run_bench.py`) and `vad` (the live segmentation). `--out` writes
+  `run_bench.py`-style JSON. `examples/gigaam_features.rs` together with
+  `scripts/compare_features.py` checks `LogMel` against the Python references.
 
 ## Known limits
 

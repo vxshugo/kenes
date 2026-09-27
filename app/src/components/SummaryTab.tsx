@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { copyText, downloadText } from "../lib/clipboard";
 import { fileSlug, formatTime, isoDate, meetingMarkdown } from "../lib/format";
+import { contextWindow } from "../llm/budget";
+import { cacheHitRate, formatCost, formatTokens, type UsageTotals } from "../llm/usage";
 import type { ControllerState, SummaryDoc } from "../session/controller";
 import { controller } from "../session/useController";
 import { IconCheck, IconCopy, IconDownload, IconRefresh } from "./Icons";
@@ -16,6 +18,58 @@ function DocView({ doc, empty }: { doc: SummaryDoc; empty: string }) {
       {doc.error && <p className="card-error">{doc.error}</p>}
       {doc.truncated && <p className="muted small">Текст обрезан по лимиту длины.</p>}
       {doc.note && <p className="muted small">{doc.note}</p>}
+    </>
+  );
+}
+
+/** «раз» / «раза»: 1, 5–20 раз; 2–4 раза. */
+function times(n: number): string {
+  const d = n % 10;
+  const t = n % 100;
+  return d >= 2 && d <= 4 && (t < 12 || t > 14) ? "раза" : "раз";
+}
+
+/** Claude tokens, cache hit rate and approximate cost of this meeting. */
+function UsageView({ usage, model }: { usage: UsageTotals; model: string }) {
+  if (!usage.requests) {
+    return <p className="muted small">Запросов к Claude в этой встрече ещё не было.</p>;
+  }
+  const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
+  const hit = cacheHitRate(usage);
+  const window = contextWindow(model);
+  return (
+    <>
+      <dl className="usage-grid">
+        <div>
+          <dt>Запросов</dt>
+          <dd>{usage.requests}</dd>
+        </div>
+        <div title="Все входные токены: без кэша + запись в кэш + чтение из кэша">
+          <dt>Вход</dt>
+          <dd>{formatTokens(prompt)}</dd>
+        </div>
+        <div title="Доля входных токенов, прочитанных из кэша промпта (cache_read_input_tokens)">
+          <dt>Из кэша</dt>
+          <dd>{hit === null ? "—" : `${Math.round(hit * 100)}%`}</dd>
+        </div>
+        <div title="Выходные токены, включая размышления модели">
+          <dt>Выход</dt>
+          <dd>{formatTokens(usage.output)}</dd>
+        </div>
+        <div title="Примерно, по ценам API для ответившей модели">
+          <dt>≈ Цена</dt>
+          <dd>
+            {formatCost(usage.cost)}
+            {usage.unpriced > 0 ? "+" : ""}
+          </dd>
+        </div>
+      </dl>
+      <p className="muted small usage-detail">
+        Без кэша {formatTokens(usage.input)} · запись в кэш {formatTokens(usage.cacheWrite)} · чтение из кэша {formatTokens(usage.cacheRead)}
+        {usage.peakPrompt > 0 && ` · самый длинный запрос ${formatTokens(usage.peakPrompt)} из ${formatTokens(window)}`}
+        {usage.rollovers > 0 && ` · разговор сжат ${usage.rollovers} ${times(usage.rollovers)}`}
+        {usage.unpriced > 0 && ` · цена неизвестна для ${usage.unpriced} запр.`}
+      </p>
     </>
   );
 }
@@ -109,6 +163,14 @@ export function SummaryTab({ state }: { state: ControllerState }) {
               : "Автообновление выключено в настройках — можно обновить вручную."
           }
         />
+      </section>
+
+      <section className="doc usage" aria-label="Расход Claude">
+        <header className="doc-head">
+          <h2>Расход Claude</h2>
+          <span className="muted small">{state.settings.claudeModel}</span>
+        </header>
+        <UsageView usage={state.usage} model={state.settings.claudeModel} />
       </section>
     </div>
   );

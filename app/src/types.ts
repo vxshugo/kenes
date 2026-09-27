@@ -73,6 +73,35 @@ export type Meeting = MeetingSummary & {
   speakers: Speaker[];
 };
 
+/** `session_status`: the running session, for a UI that (re)loads mid-meeting. */
+export type LiveSession = { meetingId: string; state: SessionState };
+
+/** What a system-wide shortcut does (`kenes://hotkey` payload). */
+export type HotkeyAction = "hint" | "recap" | "toggle";
+/** Accelerators like `CommandOrControl+Alt+Enter` (modifiers, then a `KeyboardEvent.code`). */
+export type HotkeyBindings = Record<HotkeyAction, string>;
+/** `configure_hotkeys` argument. */
+export type HotkeyConfig = { enabled: boolean } & HotkeyBindings;
+export type HotkeyBackend = "portal" | "plugin" | "none";
+export type HotkeyStatus = {
+  /** portal: XDG GlobalShortcuts (Wayland, the system owns the keys); plugin: macOS / X11 key grab. */
+  backend: HotkeyBackend;
+  state: "off" | "pending" | "active" | "cancelled" | "unavailable" | "error";
+  /** What each action is bound to, as the system describes it; null = not bound. */
+  bindings: Array<{ action: HotkeyAction; trigger: string | null }>;
+  message: string | null;
+};
+export type PlatformInfo = {
+  os: string;
+  /** "wayland" / "x11" on Linux, null elsewhere (and in the browser mock). */
+  sessionType: string | null;
+  desktop: string | null;
+  gnome: boolean;
+  /** The window runs under XWayland because of `gnomeAlwaysOnTop`. */
+  x11Forced: boolean;
+  hotkeyBackend: HotkeyBackend;
+};
+
 export type VoiceprintStatus = { enrolled: boolean; createdAt: string | null };
 export type EnrollResult = { speechMs: number };
 
@@ -96,6 +125,10 @@ export type Settings = {
   micMode: MicMode;
   micDevice: string | null;
   systemDevice: string | null;
+  /** Echo cancellation of the call audio picked up by the mic (kenes-aec); matters without headphones. */
+  echoCancellation: boolean;
+  /** Read by the app shell at start-up: run under XWayland on GNOME Wayland so the window can stay on top. */
+  gnomeAlwaysOnTop: boolean;
   // UI only
   claudeModel: string;
   hintEffort: HintEffort;
@@ -107,6 +140,15 @@ export type Settings = {
   rollingSummaryMinutes: number;
   answerLanguage: AnswerLanguage;
   profile: string;
+  /** System-wide shortcuts (`configure_hotkeys`). */
+  globalHotkeys: boolean;
+  hotkeys: HotkeyBindings;
+};
+
+export const DEFAULT_HOTKEYS: HotkeyBindings = {
+  hint: "CommandOrControl+Alt+Enter",
+  recap: "CommandOrControl+Alt+KeyK",
+  toggle: "CommandOrControl+Alt+KeyP",
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -117,6 +159,8 @@ export const DEFAULT_SETTINGS: Settings = {
   micMode: "me",
   micDevice: null,
   systemDevice: null,
+  echoCancellation: true,
+  gnomeAlwaysOnTop: true,
   claudeModel: "claude-opus-5",
   hintEffort: "low",
   summaryEffort: "high",
@@ -125,6 +169,8 @@ export const DEFAULT_SETTINGS: Settings = {
   rollingSummaryMinutes: 4,
   answerLanguage: "auto",
   profile: "",
+  globalHotkeys: true,
+  hotkeys: DEFAULT_HOTKEYS,
 };
 
 const HINT_EFFORTS: readonly HintEffort[] = ["low", "medium", "high"];
@@ -158,6 +204,21 @@ export function parseMyNames(v: unknown): string[] {
   return out;
 }
 
+const ACCELERATOR = /^(?:(?:CommandOrControl|Control|Ctrl|Alt|Shift|Super)\+)+[A-Za-z0-9]+$/;
+
+/** A usable accelerator: at least one modifier other than Shift, then one key. */
+export function isAccelerator(v: unknown): v is string {
+  if (typeof v !== "string" || !ACCELERATOR.test(v)) return false;
+  const parts = v.split("+");
+  return parts.slice(0, -1).some((m) => m !== "Shift");
+}
+
+function normalizeHotkeys(v: unknown): HotkeyBindings {
+  const r = (v && typeof v === "object" ? v : {}) as Record<string, unknown>;
+  const pick = (k: keyof HotkeyBindings) => (isAccelerator(r[k]) ? (r[k] as string) : DEFAULT_HOTKEYS[k]);
+  return { hint: pick("hint"), recap: pick("recap"), toggle: pick("toggle") };
+}
+
 /** Fills gaps and drops garbage in whatever the backend returned (it may be `{}` on first run). */
 export function normalizeSettings(raw: unknown): Settings {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
@@ -183,6 +244,8 @@ export function normalizeSettings(raw: unknown): Settings {
     micMode,
     micDevice: strOrNull(r.micDevice),
     systemDevice: strOrNull(r.systemDevice),
+    echoCancellation: bool(r.echoCancellation, d.echoCancellation),
+    gnomeAlwaysOnTop: bool(r.gnomeAlwaysOnTop, d.gnomeAlwaysOnTop),
     claudeModel: str(r.claudeModel, d.claudeModel).trim(),
     hintEffort: oneOf(r.hintEffort, HINT_EFFORTS, d.hintEffort),
     summaryEffort: oneOf(r.summaryEffort, SUMMARY_EFFORTS, d.summaryEffort),
@@ -191,5 +254,7 @@ export function normalizeSettings(raw: unknown): Settings {
     rollingSummaryMinutes: num(r.rollingSummaryMinutes, d.rollingSummaryMinutes, 0, 120),
     answerLanguage: oneOf(r.answerLanguage, LANGUAGES, d.answerLanguage),
     profile: typeof r.profile === "string" ? r.profile : d.profile,
+    globalHotkeys: bool(r.globalHotkeys, d.globalHotkeys),
+    hotkeys: normalizeHotkeys(r.hotkeys),
   } as Settings;
 }

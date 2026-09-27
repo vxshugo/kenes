@@ -164,6 +164,17 @@ describe("streamMessage", () => {
     expect((calls[0] as { fallbacks?: string }).fallbacks).toBe("default");
     expect((calls[1] as { fallbacks?: string }).fallbacks).toBeUndefined();
   });
+
+  it("a 400 that the retry without fallbacks doesn't fix keeps the fallbacks for later requests", async () => {
+    // e.g. «credit balance is too low» or «prompt is too long»: nothing to do with the beta.
+    const bad = () => Anthropic.APIError.generate(400, { error: { message: "Your credit balance is too low" } }, "bad", new Headers());
+    const { client, calls } = fakeClient([bad(), bad(), { content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" }]);
+    const opts = { ...OPTS, model: "claude-fable-5-1" };
+    await expect(streamMessage(client, payload, opts)).rejects.toBeInstanceOf(Anthropic.BadRequestError);
+    expect(calls).toHaveLength(2);
+    await streamMessage(client, payload, opts);
+    expect((calls[2] as { fallbacks?: string }).fallbacks).toBe("default");
+  });
 });
 
 describe("describeError", () => {
@@ -256,6 +267,15 @@ describe("structured outputs", () => {
     expect(out.text).toBe('{"suggestions":[]}');
     expect((calls[0] as { output_config?: { format?: unknown } }).output_config?.format).toEqual(format);
     expect((calls[1] as { output_config?: { format?: unknown } }).output_config?.format).toBeUndefined();
+  });
+
+  it("an unrelated 400 doesn't switch structured outputs off for the model", async () => {
+    const bad = () => Anthropic.APIError.generate(400, { error: { message: "Your credit balance is too low" } }, "bad", new Headers());
+    const { client, calls } = fakeClient([bad(), bad(), { content: [{ type: "text", text: "{}" }], stop_reason: "end_turn" }]);
+    const opts = { model: "claude-sonnet-5", effort: "low" as const, maxTokens: 4000, fallbacks: false, format };
+    await expect(streamMessage(client, payload, opts)).rejects.toBeInstanceOf(Anthropic.BadRequestError);
+    await streamMessage(client, payload, opts);
+    expect((calls[2] as { output_config?: { format?: unknown } }).output_config?.format).toEqual(format);
   });
 });
 

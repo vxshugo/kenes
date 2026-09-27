@@ -1,7 +1,7 @@
 //! kenes-transcribe: run the kenes STT pipeline on a WAV file.
 //!
 //! ```text
-//! kenes-transcribe <file.wav> [--model <id>] [--threads 4] [--source mic|system]
+//! kenes-transcribe <file.wav> [--model <id>] [--backend auto|ort|sherpa] [--threads 4] [--source mic|system]
 //!                  [--simulate-live [--speed 1.0] [--partial-ms 700] [--other <file2.wav>]]
 //!                  [--max-segment-ms 20000]
 //!                  [--bench] [--models-dir <dir>]
@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use kenes_stt::{
-    available_models_in, ensure_model, is_downloaded, model_path, verify_model, SttConfig,
-    Transcriber,
+    available_models_in, ensure_model, is_downloaded, model_path, verify_model, SttBackend,
+    SttConfig, Transcriber,
 };
 use kenes_types::{AudioChunk, Segment, Source, SAMPLE_RATE};
 
@@ -27,6 +27,7 @@ usage: kenes-transcribe <file.wav> [options]
 
 options:
   --model <id>          model id (default: gigaam-multilingual-ctc)
+  --backend <b>         auto (default), ort (ONNX Runtime + GigaAM features) or sherpa
   --threads <n>         recognizer threads (default: 4)
   --source mic|system   which source to label the audio as (default: mic)
   --simulate-live       stream 100 ms chunks through the live Transcriber
@@ -41,6 +42,7 @@ options:
 struct Args {
     file: Option<PathBuf>,
     model: String,
+    backend: SttBackend,
     threads: i32,
     source: Source,
     live: bool,
@@ -60,6 +62,7 @@ fn parse_args() -> Result<Args> {
     let mut a = Args {
         file: None,
         model: defaults.model_id,
+        backend: SttBackend::Auto,
         threads: defaults.num_threads,
         source: Source::Mic,
         live: false,
@@ -82,6 +85,7 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             "--model" => a.model = value("--model")?,
+            "--backend" => a.backend = value("--backend")?.parse()?,
             "--threads" => a.threads = value("--threads")?.parse()?,
             "--source" => {
                 a.source = match value("--source")?.as_str() {
@@ -164,11 +168,14 @@ fn run() -> Result<()> {
         max_segment_ms: args.max_segment_ms,
     };
     let t0 = Instant::now();
-    let mut transcriber = Transcriber::new(cfg)?;
+    let mut transcriber = Transcriber::with_backend(cfg, args.backend)?;
     let load_s = t0.elapsed().as_secs_f64();
     eprintln!(
-        "loaded {} in {:.2} s ({} threads)",
-        args.model, load_s, args.threads
+        "loaded {} in {:.2} s ({} backend, {} threads)",
+        args.model,
+        load_s,
+        transcriber.backend(),
+        args.threads
     );
 
     if args.bench {

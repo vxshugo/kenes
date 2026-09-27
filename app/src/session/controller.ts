@@ -2,7 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { getBackend, type Backend } from "../backend";
 import { applyFormat, type MeetingFormat } from "../lib/meetingFormat";
 import { createClient, describeError, isAbort, type StreamOutcome } from "../llm/client";
-import { Conversation } from "../llm/conversation";
+import { Conversation, type RolloverInfo } from "../llm/conversation";
 import { Copilot } from "../llm/copilot";
 import { SYSTEM_PROMPT, compareSegments, formatContextBlock, formatMeetingDate } from "../llm/prompts";
 import { applyRelabel, isRenamable, SpeakerDirectory } from "../llm/speakers";
@@ -21,6 +21,7 @@ import {
   type AutoKind,
   type TaskSpec,
 } from "../llm/tasks";
+import { cardsFromNotes, inferMicMode, latestNote, loadUsage, phaseFor, saveUsage } from "./restore";
 import {
   AUTO_HINT_DEBOUNCE_MS,
   evaluateAutoHint,
@@ -31,11 +32,17 @@ import {
   SILENCE_WAIT_MS,
   suggestionsDue,
 } from "../llm/triggers";
+import { addUsage, EMPTY_USAGE, type UsageTotals } from "../llm/usage";
 import { DEFAULT_SETTINGS } from "../types";
 import type {
   EnrollResult,
+  HotkeyAction,
+  HotkeyStatus,
+  LiveSession,
+  Meeting,
   MicMode,
   PipelineEvent,
+  PlatformInfo,
   Segment,
   SessionState,
   Settings,
@@ -117,6 +124,11 @@ export type ControllerState = {
   voiceprint: VoiceprintStatus | null;
   /** `enroll_voice` is recording. */
   enrolling: boolean;
+  /** Claude token usage and approximate cost of the current meeting. */
+  usage: UsageTotals;
+  /** System-wide shortcuts, as the desktop shell reports them. */
+  hotkeys: HotkeyStatus | null;
+  platform: PlatformInfo | null;
 };
 
 export type Levels = Record<Source, number>;
@@ -152,12 +164,42 @@ const INITIAL: ControllerState = {
   suggesting: false,
   voiceprint: null,
   enrolling: false,
+  usage: EMPTY_USAGE,
+  hotkeys: null,
+  platform: null,
 };
 
 const ROLLING_TICK_MS = 10_000;
 const STOP_GRACE_MS = 400;
 const MAX_CARDS = 30;
 const RELABEL_NOTE = "После итогов диаризация уточнила говорящих — «Сгенерировать заново», чтобы учесть.";
+/** At most one rolling summary per this interval is requested because the context is filling up. */
+const PRESSURE_SUMMARY_MS = 60_000;
+
+/** The hotkey settings whose system dialog the user dismissed (so it isn't reopened on every start). */
+const HOTKEYS_CANCELLED = "kenes.hotkeys.cancelled";
+
+function readStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {
+    // blocked storage: the dialog may just come back next time
+  }
+}
+
+/** Whether the live actions («Что ответить?», «Кратко», …) make sense in this phase. */
+export function canAct(state: ControllerState): boolean {
+  return ["loading", "running", "stopping", "stopped"].includes(state.phase) || (state.phase === "error" && state.finals.length > 0);
+}
 
 type CardOptions = { auto?: boolean; onSkip?: () => void };
 
@@ -208,6 +250,17 @@ export class SessionController {
   private relabeledAfterFinal = false;
   private settingsSaving: Promise<unknown> = Promise.resolve();
   private startPending = false;
+  /** Events that arrive while a reattach is loading the meeting; replayed after it. */
+  private reattachBuffer: PipelineEvent[] | null = null;
+  private unlistenHotkeys: Array<() => void> = [];
+  private hotkeyListeners = new Set<(action: HotkeyAction) => void>();
+  private hotkeysApplied: string | null = null;
+  private lastPressureAt: number | null = null;
+  /**
+   * The last complete rolling summary: what a rollover or the final summary carries over.
+   * `state.rolling.text` can't serve, it holds the half-written text while a new one streams.
+   */
+  private rollingSummary: string | null = null;
 
   constructor(private readonly deps: ControllerDeps = {}) {}
 
@@ -264,14 +317,25 @@ export class SessionController {
     try {
       const backend = this.deps.backend ?? (await getBackend());
       this.backend = backend;
-      const [settings, apiKey, voiceprint] = await Promise.all([
+      const [settings, apiKey, voiceprint, platform] = await Promise.all([
         backend.getSettings(),
         backend.getApiKey().catch(() => null),
         backend.voiceprintStatus().catch(() => null),
+        backend.platformInfo().catch(() => null),
       ]);
+      // Hold events until we know whether a session is already running (webview reload).
+      this.reattachBuffer = [];
       this.unlisten = await backend.onEvent((e) => this.onEvent(e));
-      this.set({ ready: true, backendKind: backend.kind, settings, apiKey: apiKey || null, voiceprint, micMode: settings.micMode });
+      this.unlistenHotkeys = await Promise.all([
+        backend.onHotkey((a) => this.onHotkey(a)),
+        backend.onHotkeyStatus((st) => this.set({ hotkeys: st })),
+      ]).catch(() => []);
+      this.set({ backendKind: backend.kind, settings, apiKey: apiKey || null, voiceprint, platform, micMode: settings.micMode });
+      await this.reattach(backend, settings);
+      this.set({ ready: true });
+      void this.applyHotkeys(settings);
     } catch (e) {
+      this.flushReattachBuffer();
       this.set({ ready: true, initError: describeError(e) });
     }
   }
@@ -279,8 +343,159 @@ export class SessionController {
   dispose() {
     this.unlisten?.();
     this.unlisten = null;
+    for (const u of this.unlistenHotkeys) u();
+    this.unlistenHotkeys = [];
     this.stopTimers();
     this.copilot?.close();
+  }
+
+  // ---- reattach after a webview reload ----
+
+  /**
+   * If a session is already running (the webview reloaded mid-meeting), restores it from
+   * storage: transcript, speaker names, hints, the rolling summary, the timer, and a Claude
+   * conversation rebuilt append-only from the stored transcript. Events that arrived
+   * meanwhile are replayed afterwards (duplicates are ignored by segment id).
+   */
+  private async reattach(backend: Backend, settings: Settings) {
+    try {
+      const live = await backend.sessionStatus().catch(() => null);
+      if (!live) return;
+      const meeting = await backend.getMeeting(live.meetingId);
+      this.restore(meeting, live, settings);
+      this.toast("Подключились к идущей встрече.", "info");
+    } catch (e) {
+      this.toast(`Не удалось подключиться к идущей встрече: ${describeError(e)}`);
+    } finally {
+      this.flushReattachBuffer();
+    }
+  }
+
+  private flushReattachBuffer() {
+    const buffered = this.reattachBuffer ?? [];
+    this.reattachBuffer = null;
+    for (const e of buffered) this.onEvent(e);
+  }
+
+  private restore(meeting: Meeting, live: LiveSession, settings: Settings) {
+    const micMode = inferMicMode(meeting.segments, settings.micMode);
+    const names: Record<string, string> = {};
+    for (const sp of meeting.speakers) if (sp.name) names[sp.label] = sp.name;
+    const speakers = new SpeakerDirectory(micMode, names);
+    const startedAt = Date.parse(meeting.startedAt);
+    const setup = { captureMic: settings.captureMic, captureSystem: settings.captureSystem, micMode };
+    const conversation = new Conversation(
+      SYSTEM_PROMPT,
+      formatContextBlock({
+        title: meeting.title,
+        context: meeting.context,
+        profile: settings.profile,
+        setup,
+        voiceprint: !!this.state.voiceprint?.enrolled,
+        myNames: settings.myNames,
+        date: formatMeetingDate(Number.isFinite(startedAt) ? new Date(startedAt) : new Date()),
+      }),
+      speakers,
+    );
+    const finals = meeting.segments
+      .filter((s) => s.isFinal !== false && s.text.trim())
+      .map((s) => ({ ...s, isFinal: true, speaker: s.speaker ?? null }))
+      .sort(compareSegments);
+    // Everything stored goes out with the next turn (or into a rollover seed if it's too long).
+    for (const f of finals) conversation.addFinal(f);
+    this.copilot?.close();
+    this.speakers = speakers;
+    this.copilot = this.newCopilot(conversation);
+    this.resetSessionCounters();
+    const rolling = latestNote(meeting.notes, "summary");
+    const final = latestNote(meeting.notes, "final");
+    const at = (n: { createdAt: string } | null) => (n ? Date.parse(n.createdAt) || Date.now() : null);
+    if (rolling) this.lastRollingAt = at(rolling);
+    this.rollingSummary = rolling?.content.trim() || null;
+    const phase = phaseFor(live.state);
+    if (phase === "running") this.runningSince = Number.isFinite(startedAt) ? startedAt : Date.now();
+    this.set({
+      phase,
+      statusMessage: null,
+      modelProgress: null,
+      error: phase === "error" ? "Ошибка распознавания" : null,
+      meetingId: meeting.id,
+      title: meeting.title,
+      context: meeting.context,
+      startedAt: Number.isFinite(startedAt) ? startedAt : Date.now(),
+      endedAt: null,
+      captureSystem: settings.captureSystem,
+      captureMic: settings.captureMic,
+      micMode,
+      finals,
+      partials: [],
+      cards: cardsFromNotes(meeting.notes, MAX_CARDS),
+      rolling: rolling ? { ...EMPTY_DOC, status: "done", text: rolling.content, updatedAt: at(rolling) } : EMPTY_DOC,
+      final: final ? { ...EMPTY_DOC, status: "done", text: final.content, updatedAt: at(final) } : EMPTY_DOC,
+      speakerNames: speakers.snapshot(),
+      suggestions: [],
+      suggesting: false,
+      usage: loadUsage(meeting.id) ?? EMPTY_USAGE,
+    });
+    if (phase !== "error") this.startTimers();
+  }
+
+  // ---- global hotkeys ----
+
+  /** `listener` runs after a system-wide shortcut fired (the app switches to the Live tab). */
+  onHotkeyAction(listener: (action: HotkeyAction) => void): () => void {
+    this.hotkeyListeners.add(listener);
+    return () => this.hotkeyListeners.delete(listener);
+  }
+
+  private onHotkey(action: HotkeyAction) {
+    // "toggle" is handled by the shell (show/hide the window).
+    if (action === "toggle") return;
+    if (!canAct(this.state)) {
+      this.toast("Горячая клавиша сработает, когда идёт встреча.", "info");
+      return;
+    }
+    if (action === "hint") this.hint();
+    else if (action === "recap") this.recap(5);
+    for (const l of this.hotkeyListeners) l(action);
+  }
+
+  /**
+   * Registers the system-wide shortcuts from the settings (no-op when they didn't change). If
+   * the user dismissed the system's dialog for these same settings before, it isn't shown again
+   * on every start: Settings offers «Назначить сочетания» instead.
+   */
+  private async applyHotkeys(settings: Settings, force = false) {
+    const config = { enabled: settings.globalHotkeys, ...settings.hotkeys };
+    const key = JSON.stringify(config);
+    if (!force && key === this.hotkeysApplied) return;
+    this.hotkeysApplied = key;
+    if (!force && config.enabled && readStorage(HOTKEYS_CANCELLED) === key) {
+      this.set({
+        hotkeys: {
+          backend: this.state.platform?.hotkeyBackend ?? "portal",
+          state: "cancelled",
+          bindings: [],
+          message: "Сочетания не назначены: в прошлый раз системное окно закрыли без подтверждения.",
+        },
+      });
+      return;
+    }
+    try {
+      const status = await this.api.configureHotkeys(config);
+      if (this.hotkeysApplied !== key) return;
+      if (status.state === "cancelled") writeStorage(HOTKEYS_CANCELLED, key);
+      else if (status.state === "active" || status.state === "off") writeStorage(HOTKEYS_CANCELLED, null);
+      this.set({ hotkeys: status });
+    } catch (e) {
+      if (this.hotkeysApplied !== key) return;
+      this.set({ hotkeys: { backend: "none", state: "error", bindings: [], message: describeError(e) } });
+    }
+  }
+
+  /** Asks the system again (e.g. after the portal dialog was cancelled). */
+  retryHotkeys() {
+    void this.applyHotkeys(this.state.settings, true);
   }
 
   get api(): Backend {
@@ -294,6 +509,7 @@ export class SessionController {
     });
     this.settingsSaving = saving.catch(() => undefined);
     await saving;
+    void this.applyHotkeys(settings);
   }
 
   /** The meeting format from the pre-start sheet, persisted before `start_session` reads it. */
@@ -357,27 +573,8 @@ export class SessionController {
       }),
       speakers,
     );
-    this.copilot = new Copilot(conversation, {
-      getClient: this.getClient,
-      getConfig: () => ({
-        model: this.state.settings.claudeModel,
-        hintEffort: this.state.settings.hintEffort,
-        summaryEffort: this.state.settings.summaryEffort,
-      }),
-    });
-    this.cardSpecs.clear();
-    this.lastAutoHintAt = null;
-    this.lastRollingAt = null;
-    this.finalsSinceRolling = 0;
-    this.lastSuggestAt = null;
-    this.finalsSinceSuggest = 0;
-    this.rejected = [];
-    this.relabeledAfterFinal = false;
-    this.cancelSilence();
-    this.liveInFlight = 0;
-    this.runningSince = null;
-    this.levels = { mic: 0, system: 0 };
-    this.emitLevels();
+    this.copilot = this.newCopilot(conversation);
+    this.resetSessionCounters();
     this.set({
       phase: "starting",
       statusMessage: null,
@@ -399,14 +596,81 @@ export class SessionController {
       speakerNames: {},
       suggestions: [],
       suggesting: false,
+      usage: EMPTY_USAGE,
     });
     try {
       const { meetingId } = await this.api.startSession(cleanTitle, context);
+      // Read afresh: the checks above narrowed `this.state.phase`, but Stop may have run meanwhile.
+      const phase = this.getState().phase;
+      if (phase === "stopping" || phase === "stopped" || phase === "idle") {
+        // Stop was pressed while start_session was still running. Its stop_session found no
+        // session yet, so this one would record unseen, and nothing in the UI could stop it.
+        await this.api.stopSession().catch(() => undefined);
+        return;
+      }
       this.set((s) => ({ meetingId, phase: s.phase === "starting" ? "loading" : s.phase }));
-      this.startTimers();
+      if (this.isActive) this.startTimers();
     } catch (e) {
       this.set({ phase: "error", error: `Не удалось начать запись: ${describeError(e)}` });
     }
+  }
+
+  private newCopilot(conversation: Conversation): Copilot {
+    return new Copilot(conversation, {
+      getClient: this.getClient,
+      getConfig: () => ({
+        model: this.state.settings.claudeModel,
+        hintEffort: this.state.settings.hintEffort,
+        summaryEffort: this.state.settings.summaryEffort,
+      }),
+      getSummary: () => this.rollingSummary,
+      onUsage: (out, route) => this.recordUsage(out, route === "live" || route === "fork"),
+      onContextPressure: () => this.onContextPressure(),
+      onRollover: (info) => this.onRollover(info),
+    });
+  }
+
+  private resetSessionCounters() {
+    this.cardSpecs.clear();
+    this.lastAutoHintAt = null;
+    this.lastRollingAt = null;
+    this.finalsSinceRolling = 0;
+    this.lastSuggestAt = null;
+    this.finalsSinceSuggest = 0;
+    this.rejected = [];
+    this.relabeledAfterFinal = false;
+    this.lastPressureAt = null;
+    this.rollingSummary = null;
+    this.cancelSilence();
+    this.liveInFlight = 0;
+    this.runningSince = null;
+    this.levels = { mic: 0, system: 0 };
+    this.emitLevels();
+  }
+
+  // ---- usage and context ----
+
+  private recordUsage(out: StreamOutcome, live: boolean) {
+    const usage = addUsage(this.state.usage, out.model || this.state.settings.claudeModel, out.usage, live);
+    this.set({ usage });
+    if (this.state.meetingId) saveUsage(this.state.meetingId, usage);
+  }
+
+  /** The conversation nears the rollover point: refresh the rolling summary it will carry over. */
+  private onContextPressure() {
+    const now = Date.now();
+    if (this.lastPressureAt !== null && now - this.lastPressureAt < PRESSURE_SUMMARY_MS) return;
+    if (this.state.rolling.status === "streaming" || !this.state.apiKey) return;
+    this.lastPressureAt = now;
+    void this.generateRolling();
+  }
+
+  private onRollover(info: RolloverInfo) {
+    const usage = { ...this.state.usage, rollovers: this.state.usage.rollovers + 1 };
+    this.set({ usage });
+    if (this.state.meetingId) saveUsage(this.state.meetingId, usage);
+    const seed = info.summary ? "с резюме и последних" : "с последних";
+    this.toast(`Длинная встреча: разговор с Claude продолжен ${seed} ${info.carriedLines} реплик, чтобы уместиться в контекст модели.`, "info");
   }
 
   async stop() {
@@ -463,6 +727,7 @@ export class SessionController {
       micMode: this.state.settings.micMode,
       captureMic: this.state.settings.captureMic,
       captureSystem: this.state.settings.captureSystem,
+      usage: EMPTY_USAGE,
     });
   }
 
@@ -482,6 +747,10 @@ export class SessionController {
   // ---- backend events ----
 
   private onEvent(e: PipelineEvent) {
+    if (this.reattachBuffer) {
+      this.reattachBuffer.push(e);
+      return;
+    }
     switch (e.type) {
       case "segment":
         this.onSegment(e);
@@ -958,6 +1227,7 @@ export class SessionController {
           this.set((s) => ({ rolling: { ...s.rolling, text } }));
         },
       });
+      if (copilot === this.copilot) this.rollingSummary = out.text;
       this.set({
         rolling: { status: "done", text: out.text, error: null, truncated: out.truncated, updatedAt: Date.now(), note: outcomeNote(out, model) },
       });

@@ -3,6 +3,7 @@
 //! are thin shells over this crate.
 
 pub mod diarize;
+pub mod echo_guard;
 pub mod session;
 pub mod settings;
 pub mod store;

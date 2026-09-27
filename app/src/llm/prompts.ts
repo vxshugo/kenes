@@ -174,6 +174,26 @@ export function transcriptUpdateBlock(lines: string): string {
   return `<transcript_update>\n${lines}\n</transcript_update>`;
 }
 
+/**
+ * Opens a conversation that continues a long meeting (after a rollover or a reattach): what
+ * was said before, compressed into the rolling summary plus the newest lines.
+ */
+export function carryoverBlock(opts: { summary: string | null; transcript: string; dropped: boolean; namesLine: string | null }): string {
+  return [
+    "<earlier_in_meeting>",
+    opts.dropped
+      ? "Встреча идёт давно. Начало разговора сжато, чтобы уместиться в контекст: сначала резюме, потом последние реплики до этого момента."
+      : "Встреча уже идёт. Ниже — расшифровка до этого момента.",
+    opts.summary ? `<summary_so_far>\n${opts.summary}\n</summary_so_far>` : null,
+    opts.dropped && !opts.summary ? "Резюме ранней части нет; более ранние реплики сюда не вошли." : null,
+    `<recent_transcript>\n${opts.transcript || "(пока пусто)"}\n</recent_transcript>`,
+    opts.namesLine,
+    "</earlier_in_meeting>",
+  ]
+    .filter((l): l is string => !!l)
+    .join("\n");
+}
+
 export function fullTranscriptBlock(lines: string): string {
   return `<full_transcript>\n${lines || "(расшифровка пуста)"}\n</full_transcript>`;
 }

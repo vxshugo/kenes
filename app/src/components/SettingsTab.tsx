@@ -5,6 +5,7 @@ import type { ControllerState } from "../session/controller";
 import { controller } from "../session/useController";
 import { defaultAutoHintMode, parseMyNames } from "../types";
 import type { AnswerLanguage, AutoHintMode, DeviceInfo, HintEffort, MicMode, ModelInfo, Settings, SummaryEffort } from "../types";
+import { HotkeysSection } from "./HotkeysSection";
 import { IconEye, IconEyeOff, IconMic, IconTrash } from "./Icons";
 
 const MODEL_SUGGESTIONS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
@@ -232,7 +233,8 @@ export function SettingsTab({ state }: { state: ControllerState }) {
     setSaveMsg(null);
     try {
       await controller.saveSettings({ ...draft, claudeModel: draft.claudeModel.trim() || "claude-opus-5" });
-      setSaveMsg({ text: sessionLive ? "Сохранено. Настройки звука применятся со следующей записи." : "Сохранено.", tone: "ok" });
+      const restart = draft.gnomeAlwaysOnTop !== state.settings.gnomeAlwaysOnTop ? " Закрепление окна применится после перезапуска Kenes." : "";
+      setSaveMsg({ text: (sessionLive ? "Сохранено. Настройки звука применятся со следующей записи." : "Сохранено.") + restart, tone: "ok" });
     } catch (e) {
       setSaveMsg({ text: describeError(e), tone: "error" });
     } finally {
@@ -438,8 +440,20 @@ export function SettingsTab({ state }: { state: ControllerState }) {
               ))}
             </select>
           </label>
+          <label className="check">
+            <input type="checkbox" checked={draft.echoCancellation} onChange={(e) => set("echoCancellation", e.target.checked)} />
+            <span>
+              Подавление эха
+              <span className="field-hint">
+                убирает из микрофона голоса звонка, которые звучат из колонок. Важно, если вы без наушников; работает, когда записываются
+                и микрофон, и звук звонка
+              </span>
+            </span>
+          </label>
           {devices === null && !loadError && <span className="muted small">Загрузка устройств…</span>}
         </fieldset>
+
+        <HotkeysSection state={state} draft={draft} set={set} />
 
         <VoiceSection state={state} />
         {loadError && <p className="card-error small">{loadError}</p>}

@@ -119,9 +119,9 @@ impl Diarizer {
             return None;
         }
         let embedder = self.embedder.as_mut()?;
-        let (ring, clusterer, prefix) = match seg.source {
-            Source::Mic => (&self.mic_ring, &mut self.mic, "mic"),
-            Source::System => (&self.sys_ring, &mut self.sys, "sys"),
+        let ring = match seg.source {
+            Source::Mic => &self.mic_ring,
+            Source::System => &self.sys_ring,
         };
         let duration_ms = seg.end_ms.saturating_sub(seg.start_ms);
         let embedding = if duration_ms >= self.cfg.min_embed_ms {
@@ -136,30 +136,45 @@ impl Diarizer {
         } else {
             None
         };
-        seg.speaker = clusterer.assign(embedding.as_deref(), seg.start_ms, seg.end_ms);
-        if let Some(e) = &embedding {
-            self.items.push(ClusterItem {
-                segment_id: seg.id.clone(),
-                prefix: prefix.into(),
-                embedding: e.clone(),
-                duration_ms,
-                online_label: seg.speaker.clone(),
-            });
-        }
+        self.assign(seg, embedding.as_deref());
         embedding
+    }
+
+    /// Labels `seg` online and remembers it for [`Diarizer::finish`].
+    fn assign(&mut self, seg: &mut Segment, embedding: Option<&[f32]>) {
+        let (clusterer, prefix) = match seg.source {
+            Source::Mic => (&mut self.mic, "mic"),
+            Source::System => (&mut self.sys, "sys"),
+        };
+        seg.speaker = clusterer.assign(embedding, seg.start_ms, seg.end_ms);
+        // Unembedded segments too: re-clustering moves them along with their online label.
+        self.items.push(ClusterItem {
+            segment_id: seg.id.clone(),
+            prefix: prefix.into(),
+            embedding: embedding.map(<[f32]>::to_vec).unwrap_or_default(),
+            duration_ms: seg.end_ms.saturating_sub(seg.start_ms),
+            online_label: seg.speaker.clone(),
+        });
     }
 
     /// Re-clusters the whole meeting; returns only segments whose label changed.
     pub fn finish(&self) -> Vec<(String, Option<String>)> {
-        if self.items.is_empty() {
-            return Vec::new();
+        let mut changed: Vec<(usize, Option<String>)> = Vec::new();
+        // The voiceprint is the user at the mic; a similar voice in the call is someone else.
+        for (prefix, voiceprint) in [("mic", self.voiceprint.as_deref()), ("sys", None)] {
+            let idx: Vec<usize> = (0..self.items.len()).filter(|&i| self.items[i].prefix == prefix).collect();
+            if idx.is_empty() {
+                continue;
+            }
+            let items: Vec<ClusterItem> = idx.iter().map(|&i| self.items[i].clone()).collect();
+            for (&i, (_, label)) in idx.iter().zip(recluster(&items, voiceprint, &self.cfg)) {
+                if label != self.items[i].online_label {
+                    changed.push((i, label));
+                }
+            }
         }
-        let before: std::collections::HashMap<&str, &Option<String>> =
-            self.items.iter().map(|i| (i.segment_id.as_str(), &i.online_label)).collect();
-        recluster(&self.items, self.voiceprint.as_deref(), &self.cfg)
-            .into_iter()
-            .filter(|(id, label)| before.get(id.as_str()).is_some_and(|old| *old != label))
-            .collect()
+        changed.sort_by_key(|&(i, _)| i);
+        changed.into_iter().map(|(i, label)| (self.items[i].segment_id.clone(), label)).collect()
     }
 }
 
@@ -239,7 +254,10 @@ pub fn enroll_voice(
         match rx.recv_timeout(left) {
             Ok(chunk) => samples.extend(chunk.samples),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => anyhow::bail!("микрофон отключился"),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => match capture.take_error() {
+                Some(e) => anyhow::bail!("микрофон отключился: {}", e.message),
+                None => anyhow::bail!("микрофон отключился"),
+            },
         }
     }
     capture.stop();
@@ -319,6 +337,89 @@ mod tests {
         d.label(&mut sys);
         assert_eq!(sys.speaker, None);
         assert!(d.finish().is_empty());
+    }
+
+    fn axis(k: usize) -> Vec<f32> {
+        let mut v = vec![0.0; 16];
+        v[k] = 1.0;
+        v
+    }
+
+    fn item(id: &str, prefix: &str, embedding: Vec<f32>, duration_ms: u64, online: &str) -> ClusterItem {
+        ClusterItem {
+            segment_id: id.into(),
+            prefix: prefix.into(),
+            embedding,
+            duration_ms,
+            online_label: Some(online.into()),
+        }
+    }
+
+    #[test]
+    fn voiceprint_never_turns_call_audio_into_me() {
+        // Someone in the call sounds like the user; the user is on the mic, never in the call.
+        let vp = axis(0);
+        for mode in [MicMode::Me, MicMode::Room] {
+            let mut d = Diarizer::new(None, mode, Some(vp.clone()));
+            d.items = vec![
+                item("system-1", "sys", vp.clone(), 4000, "sys:1"),
+                item("system-2", "sys", axis(5), 4000, "sys:2"),
+                item("system-3", "sys", vp.clone(), 4000, "sys:1"),
+            ];
+            assert_eq!(d.finish(), Vec::new(), "{mode:?}");
+        }
+        // The mic in room mode still gets "me" from the voiceprint.
+        let mut d = Diarizer::new(None, MicMode::Room, Some(vp.clone()));
+        d.items = vec![
+            item("mic-1", "mic", vp.clone(), 4000, "mic:1"),
+            item("system-1", "sys", vp.clone(), 4000, "sys:1"),
+        ];
+        assert_eq!(d.finish(), vec![("mic-1".to_string(), Some(ME.to_string()))]);
+    }
+
+    fn final_seg(id: &str, start_ms: u64, end_ms: u64) -> Segment {
+        Segment {
+            id: id.into(),
+            source: Source::Mic,
+            speaker: None,
+            start_ms,
+            end_ms,
+            text: "сөз".into(),
+            is_final: true,
+        }
+    }
+
+    #[test]
+    fn short_segments_follow_their_label_when_reclustered() {
+        let cfg = ClusterConfig {
+            threshold: 0.5,
+            recluster_threshold: 0.4,
+            short_segment_ms: 0,
+            short_segment_relax: 0.0,
+            min_cluster_ms: 0,
+            ..ClusterConfig::default()
+        };
+        let mut d = Diarizer::new(None, MicMode::Room, None);
+        d.mic = OnlineClusterer::new("mic", cfg.clone());
+        d.cfg = cfg;
+        // One person heard as two voices online (0.45 < 0.5), one voice offline (≥ 0.4).
+        let a = axis(0);
+        let mut b = vec![0.0; 16];
+        b[0] = 0.45;
+        b[1] = (1.0f32 - 0.45 * 0.45).sqrt();
+        let mut s1 = final_seg("mic-1", 0, 6000);
+        let mut s2 = final_seg("mic-2", 7000, 11_000);
+        let mut s3 = final_seg("mic-3", 11_500, 11_900); // too short to embed
+        d.assign(&mut s1, Some(&a));
+        d.assign(&mut s2, Some(&b));
+        d.assign(&mut s3, None);
+        let online: Vec<_> = [&s1, &s2, &s3].iter().map(|s| s.speaker.clone().unwrap()).collect();
+        assert_eq!(online, ["mic:1", "mic:2", "mic:2"]);
+        // "mic:2" is retired; the short segment must not keep it.
+        assert_eq!(
+            d.finish(),
+            vec![("mic-2".to_string(), Some("mic:1".to_string())), ("mic-3".to_string(), Some("mic:1".to_string()))]
+        );
     }
 
     #[test]

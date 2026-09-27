@@ -20,6 +20,7 @@ pub fn defaults() -> Value {
         "micMode": "me",
         "micDevice": null,
         "systemDevice": null,
+        "echoCancellation": true,
         "claudeModel": "claude-opus-5",
         "hintEffort": "low",
         "summaryEffort": "high",
@@ -51,6 +52,14 @@ pub struct CoreSettings {
     pub mic_mode: MicMode,
     pub mic_device: Option<String>,
     pub system_device: Option<String>,
+    /// Remove the call's echo from the mic (speakers without headphones). Only acts
+    /// when both sources are captured.
+    #[serde(default = "enabled")]
+    pub echo_cancellation: bool,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 /// Stored settings layered over the defaults, so new keys get sane values.
@@ -98,6 +107,19 @@ mod tests {
         assert!(c.capture_mic && c.capture_system);
         assert_eq!(c.mic_device, None);
         assert_eq!(c.mic_mode, MicMode::Me);
+        assert!(c.echo_cancellation);
+    }
+
+    #[test]
+    fn echo_cancellation_can_be_turned_off() {
+        let store = Store::open_in_memory().unwrap();
+        save(&store, &json!({"echoCancellation": false})).unwrap();
+        assert!(!core(&load(&store).unwrap()).unwrap().echo_cancellation);
+        assert!(save(&store, &json!({"echoCancellation": "no"})).is_err());
+        // Settings saved before the key existed still parse, with it on.
+        let mut old = defaults();
+        old.as_object_mut().unwrap().remove("echoCancellation");
+        assert!(core(&old).unwrap().echo_cancellation);
     }
 
     #[test]

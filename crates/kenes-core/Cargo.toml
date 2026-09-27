@@ -9,6 +9,7 @@ kenes-types = { workspace = true }
 kenes-audio = { workspace = true }
 kenes-stt = { workspace = true }
 kenes-speakers = { workspace = true }
+kenes-aec = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 log = { workspace = true }

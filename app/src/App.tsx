@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Header } from "./components/Header";
 import { HistoryTab } from "./components/HistoryTab";
 import { IconX } from "./components/Icons";
-import { LiveTab, canAct } from "./components/LiveTab";
+import { LiveTab } from "./components/LiveTab";
 import { PreStart, type Draft } from "./components/PreStart";
 import { SettingsTab } from "./components/SettingsTab";
 import { SummaryTab } from "./components/SummaryTab";
 import { hasMod, SHORTCUTS } from "./lib/keys";
+import { canAct } from "./session/controller";
 import { controller, useController } from "./session/useController";
 import "./App.css";
 
@@ -81,6 +82,9 @@ export default function App() {
       }
     }, 0);
   }, [lastSelection]);
+
+  // A system-wide shortcut ran a live action: show its card.
+  useEffect(() => controller.onHotkeyAction(() => setTab("live")), []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

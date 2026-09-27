@@ -9,21 +9,28 @@
 //! Final segments get a speaker label (see [`crate::diarize`]) before they are
 //! stored and emitted; when the session ends, labels are re-clustered once.
 //!
+//! With both sources captured (and `echoCancellation` on), the mic first goes
+//! through `kenes-aec` with the system audio as the far-end reference, before the
+//! level meter, the speaker ring buffer and the transcriber see it; mic finals that
+//! still repeat the call are dropped by [`crate::echo_guard`].
+//!
 //! Stopping drops the audio side first, so the transcriber flushes the open
 //! utterance as a final segment before the worker exits.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use crossbeam_channel::{after, bounded, select, unbounded, Receiver};
+use crossbeam_channel::{after, bounded, select, unbounded, Receiver, Sender};
+use kenes_aec::{AecConfig, StreamCanceller};
 use kenes_audio::{CaptureConfig, DeviceSel};
 use kenes_stt::{SttConfig, Transcriber};
 use kenes_types::{AudioChunk, PipelineEvent, Segment, SessionState, Source, SpeakerChange, SAMPLE_RATE};
 
 use crate::diarize::{self, Diarizer};
+use crate::echo_guard::EchoGuard;
 use crate::settings::{CoreSettings, MicMode};
 use crate::store::Store;
 
@@ -297,27 +304,21 @@ impl Worker {
         };
         (self.sink)(status(SessionState::Running, None));
 
-        let mut levels = Levels::default();
-        let mut forward = Some(stt_tx);
+        // Without headphones the mic hears the call too: cancel it against the system audio.
+        let echo = self.settings.echo_cancellation && self.settings.capture_mic && self.settings.capture_system;
+        let mut route = Route {
+            levels: Levels::default(),
+            forward: Some(stt_tx),
+            canceller: echo.then(|| StreamCanceller::new(AecConfig::default())),
+            guard: echo.then(EchoGuard::new),
+        };
         loop {
             if self.stopped() {
                 break;
             }
             select! {
                 recv(audio_rx) -> msg => match msg {
-                    Ok(chunk) => {
-                        for ev in levels.push(&chunk) {
-                            (self.sink)(ev);
-                        }
-                        diarizer.push_audio(&chunk);
-                        if let Some(tx) = &forward {
-                            if tx.send(chunk).is_err() {
-                                // The transcriber died; keep draining audio so capture isn't blocked.
-                                forward = None;
-                                (self.sink)(PipelineEvent::Error { message: "распознавание остановилось".into() });
-                            }
-                        }
-                    }
+                    Ok(chunk) => self.on_audio(&mut route, &mut diarizer, chunk),
                     Err(_) => {
                         if matches!(capture, Audio::Live(_)) {
                             (self.sink)(PipelineEvent::Error { message: "захват звука прервался".into() });
@@ -333,10 +334,16 @@ impl Worker {
                 },
                 recv(seg_rx) -> msg => {
                     if let Ok(seg) = msg {
-                        self.emit_segment(&mut diarizer, seg);
+                        self.on_segment(&mut route, &mut diarizer, seg);
                     }
                 },
                 recv(after(Duration::from_millis(200))) -> _ => {},
+            }
+            // Mic finals the echo guard held for long enough.
+            if let Some(guard) = &mut route.guard {
+                for seg in guard.poll(Instant::now()) {
+                    self.emit_segment(&mut diarizer, seg);
+                }
             }
         }
 
@@ -346,10 +353,28 @@ impl Worker {
                 let _ = t.join();
             }
         }
-        drop(forward);
+        // The capture threads flushed their last chunks on stop; the echo canceller
+        // still holds the newest few milliseconds of mic audio.
+        for chunk in audio_rx.try_iter() {
+            self.on_audio(&mut route, &mut diarizer, chunk);
+        }
+        if let Some(mut canceller) = route.canceller.take() {
+            let rest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.finish()));
+            for chunk in rest.unwrap_or_default() {
+                self.deliver(&mut route, &mut diarizer, chunk);
+            }
+            log::info!("echo cancellation: {:?}", canceller.stats());
+        }
+        drop(route.forward.take());
         // Remaining audio already sent is transcribed; the final flush arrives here.
         for seg in seg_rx.iter() {
-            self.emit_segment(&mut diarizer, seg);
+            self.on_segment(&mut route, &mut diarizer, seg);
+        }
+        if let Some(mut guard) = route.guard.take() {
+            for seg in guard.finish(Instant::now()) {
+                self.emit_segment(&mut diarizer, seg);
+            }
+            log::info!("echo guard: {:?}", guard.stats());
         }
         let _ = stt_thread.join();
 
@@ -366,6 +391,59 @@ impl Worker {
             (self.sink)(PipelineEvent::SpeakersRelabeled { changes });
         }
         Ok(())
+    }
+
+    /// One captured chunk: the mic goes through the echo canceller first (and may be
+    /// held back briefly until the call's audio for the same moment is in).
+    fn on_audio(&self, route: &mut Route, diarizer: &mut Diarizer, chunk: AudioChunk) {
+        let Some(canceller) = &mut route.canceller else {
+            return self.deliver(route, diarizer, chunk);
+        };
+        // Third-party DSP: if it ever panics, carry on without it rather than end the meeting.
+        let ready = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.push(&chunk))) {
+            Ok(ready) => ready,
+            Err(_) => {
+                log::error!("echo canceller panicked; the mic passes through from now on");
+                (self.sink)(PipelineEvent::Error { message: "эхоподавление отключено из-за внутренней ошибки".into() });
+                route.canceller = None;
+                return self.deliver(route, diarizer, chunk);
+            }
+        };
+        if chunk.source == Source::System {
+            self.deliver(route, diarizer, chunk);
+        }
+        for chunk in ready {
+            self.deliver(route, diarizer, chunk);
+        }
+    }
+
+    /// Level meter, speaker ring buffer, echo guard, transcriber.
+    fn deliver(&self, route: &mut Route, diarizer: &mut Diarizer, chunk: AudioChunk) {
+        for ev in route.levels.push(&chunk) {
+            (self.sink)(ev);
+        }
+        if let (Some(guard), Source::System) = (&mut route.guard, chunk.source) {
+            guard.system_audio(chunk.start_ms, chunk.start_ms + chunk.duration_ms(), kenes_audio::pcm::rms(&chunk.samples));
+        }
+        diarizer.push_audio(&chunk);
+        if let Some(tx) = &route.forward {
+            if tx.send(chunk).is_err() {
+                // The transcriber died; keep draining audio so capture isn't blocked.
+                route.forward = None;
+                (self.sink)(PipelineEvent::Error { message: "распознавание остановилось".into() });
+            }
+        }
+    }
+
+    fn on_segment(&self, route: &mut Route, diarizer: &mut Diarizer, seg: Segment) {
+        match &mut route.guard {
+            Some(guard) => {
+                for seg in guard.push(seg, Instant::now()) {
+                    self.emit_segment(diarizer, seg);
+                }
+            }
+            None => self.emit_segment(diarizer, seg),
+        }
     }
 
     fn emit_segment(&self, diarizer: &mut Diarizer, mut seg: Segment) {
@@ -391,6 +469,17 @@ impl Worker {
 enum Audio {
     Live(kenes_audio::CaptureHandle),
     Replay(std::thread::JoinHandle<()>),
+}
+
+/// Where captured audio and recognized segments go, with echo handling in between.
+struct Route {
+    levels: Levels,
+    /// To the transcriber; `None` once it died.
+    forward: Option<Sender<AudioChunk>>,
+    /// Mic echo cancellation against the system audio (both sources on, setting on).
+    canceller: Option<StreamCanceller>,
+    /// Drops mic finals that repeat the call (same condition).
+    guard: Option<EchoGuard>,
 }
 
 mod replay {

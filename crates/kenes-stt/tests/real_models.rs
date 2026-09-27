@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kenes_stt::{ensure_model, models_dir, SttConfig, Transcriber, DEFAULT_MODEL};
+use kenes_stt::{ensure_model, models_dir, SttBackend, SttConfig, Transcriber, DEFAULT_MODEL};
 use kenes_types::{AudioChunk, Segment, Source, SAMPLE_RATE};
 
 const KAZAKH_LETTERS: &str = "әғқңөұүһі";
@@ -107,18 +107,42 @@ fn transcriber(model: &str, partial_interval_ms: u64) -> Transcriber {
 }
 
 fn transcriber_with(model: &str, partial_interval_ms: u64, max_segment_ms: u64) -> Transcriber {
+    transcriber_full(model, partial_interval_ms, max_segment_ms, SttBackend::Auto)
+}
+
+fn transcriber_on(model: &str, backend: SttBackend) -> Transcriber {
+    let t = transcriber_full(model, 700, SttConfig::default().max_segment_ms, backend);
+    if backend != SttBackend::Auto {
+        assert_eq!(t.backend(), backend, "{model} fell back from {backend}");
+    }
+    t
+}
+
+fn transcriber_full(
+    model: &str,
+    partial_interval_ms: u64,
+    max_segment_ms: u64,
+    backend: SttBackend,
+) -> Transcriber {
     let dir = models_dir();
     ensure_model(model, &dir, &mut |_| {}).expect("download model");
     let t0 = Instant::now();
-    let t = Transcriber::new(SttConfig {
-        model_id: model.into(),
-        models_dir: dir,
-        partial_interval_ms,
-        max_segment_ms,
-        ..SttConfig::default()
-    })
+    let t = Transcriber::with_backend(
+        SttConfig {
+            model_id: model.into(),
+            models_dir: dir,
+            partial_interval_ms,
+            max_segment_ms,
+            ..SttConfig::default()
+        },
+        backend,
+    )
     .unwrap();
-    eprintln!("loaded {model} in {:.2} s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "loaded {model} ({} backend) in {:.2} s",
+        t.backend(),
+        t0.elapsed().as_secs_f64()
+    );
     t
 }
 
@@ -451,4 +475,104 @@ fn splitter_separates_glued_turns() {
         e2 as f64 / n2 as f64
     );
     assert!(e1 * 10 < n1 && e2 * 10 < n2);
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    dot / (norm(a) * norm(b))
+}
+
+/// The ONNX Runtime backend uses the ONNX Runtime that sherpa-onnx links statically, so the
+/// Silero VAD, the speaker embedder (kenes-speakers) and both recognizer backends all run on
+/// one runtime in one process. Load them all, use them concurrently from several threads, drop
+/// everything and load again: results must not change.
+#[test]
+#[ignore = "needs models and test audio"]
+fn one_onnx_runtime_for_vad_speakers_and_both_backends() {
+    let dir = models_dir();
+    let spk_model = kenes_speakers::ensure_speaker_model(&dir, &mut |_| {}).unwrap();
+    // sherpa-onnx first (it creates the ORT environment), then `ort` joins it.
+    let mut emb = kenes_speakers::Embedder::new(&spk_model, 1).unwrap();
+    let mut ort_t = transcriber_on(DEFAULT_MODEL, SttBackend::Ort);
+    let mut sherpa_t = transcriber_on(DEFAULT_MODEL, SttBackend::Sherpa);
+
+    let (wav, reference) = clips("codeswitch", 1).remove(0);
+    let audio = read_wav(&wav);
+    let ort_text = ort_t.recognize(&audio).unwrap();
+    let sherpa_text = sherpa_t.recognize(&audio).unwrap();
+    let vad_text = join_finals(&ort_t.transcribe_buffer(Source::Mic, &audio).unwrap());
+    let voice = emb.embed(&audio).unwrap();
+    for (what, text) in [
+        ("ort", &ort_text),
+        ("sherpa", &sherpa_text),
+        ("ort+vad", &vad_text),
+    ] {
+        let (e, n) = char_errors(text, &reference);
+        eprintln!("{what}: CER {:.3}  {text}", e as f64 / n as f64);
+        assert!(e * 10 < n, "{what} CER too high: {text}");
+    }
+
+    // All four models busy at once, each from its own thread.
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for _ in 0..3 {
+                assert_eq!(ort_t.recognize(&audio).unwrap(), ort_text);
+            }
+        });
+        s.spawn(|| {
+            for _ in 0..3 {
+                assert_eq!(sherpa_t.recognize(&audio).unwrap(), sherpa_text);
+            }
+        });
+        s.spawn(|| {
+            for _ in 0..3 {
+                let v = emb.embed(&audio).unwrap();
+                assert!(cosine(&v, &voice) > 0.999);
+            }
+        });
+    });
+
+    // Tear everything down (the last sherpa-onnx object releases its ORT env reference)
+    // and start again, as a new meeting would.
+    drop((ort_t, sherpa_t, emb));
+    let mut again = transcriber_on(DEFAULT_MODEL, SttBackend::Ort);
+    assert_eq!(again.recognize(&audio).unwrap(), ort_text);
+    assert_eq!(
+        join_finals(&again.transcribe_buffer(Source::Mic, &audio).unwrap()),
+        vad_text
+    );
+    let mut emb = kenes_speakers::Embedder::new(&spk_model, 1).unwrap();
+    assert!(cosine(&emb.embed(&audio).unwrap(), &voice) > 0.999);
+}
+
+/// Every registry model loads on the ONNX Runtime backend (no silent fallback) and gets
+/// its language right; `gigaam-v3-ru-ctc` has a different vocabulary (34 symbols) and no
+/// `encoded_lengths` output.
+#[test]
+#[ignore = "needs models and test audio"]
+fn every_model_runs_on_onnx_runtime() {
+    for (model, set) in [
+        ("gigaam-multilingual-ctc", "codeswitch"),
+        ("gigaam-multilingual-large-ctc", "codeswitch"),
+        ("gigaam-v3-ru-ctc", "fleurs_ru"),
+    ] {
+        let mut t = transcriber_on(model, SttBackend::Ort);
+        let (mut errors, mut total) = (0, 0);
+        for (wav, reference) in clips(set, 2) {
+            let text = t.recognize(&read_wav(&wav)).unwrap();
+            let (e, n) = char_errors(&text, &reference);
+            eprintln!(
+                "[{model}] {}: CER {:.3}  {text}",
+                wav.display(),
+                e as f64 / n as f64
+            );
+            errors += e;
+            total += n;
+        }
+        assert!(errors * 20 < total, "{model}: CER {errors}/{total}");
+        // Short and silent inputs decode to nothing rather than failing.
+        assert_eq!(t.recognize(&[]).unwrap(), "");
+        assert_eq!(t.recognize(&vec![0.0; 800]).unwrap(), "");
+    }
 }

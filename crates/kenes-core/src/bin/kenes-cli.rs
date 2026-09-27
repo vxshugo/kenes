@@ -1,4 +1,4 @@
-//! Terminal front end for the live pipeline: `kenes-cli [--no-mic] [--no-system] [--room] [--mic <id>] [--system <id>]`.
+//! Terminal front end for the live pipeline: `kenes-cli [--no-mic] [--no-system] [--room] [--no-echo-cancel] [--mic <id>] [--system <id>]`.
 //! Prints partial and final transcript lines; Ctrl-C stops and saves the meeting.
 
 use std::io::Write;
@@ -24,6 +24,7 @@ fn main() -> Result<()> {
             "--no-mic" => core.capture_mic = false,
             "--no-system" => core.capture_system = false,
             "--room" => core.mic_mode = MicMode::Room,
+            "--no-echo-cancel" => core.echo_cancellation = false,
             "--model" => core.stt_model = args.next().expect("--model <id>"),
             "--threads" => core.num_threads = args.next().expect("--threads N").parse()?,
             "--title" => title = args.next().expect("--title <text>"),
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
             "--replay-system" => replay_system = Some(args.next().expect("--replay-system <file.wav>").into()),
             "--speed" => speed = args.next().expect("--speed N").parse()?,
             "-h" | "--help" => {
-                println!("kenes-cli [--no-mic] [--no-system] [--room] [--mic <id>] [--system <id>] [--model <id>] [--threads N] [--title <text>]\n          [--replay-mic a.wav] [--replay-system b.wav] [--speed N]");
+                println!("kenes-cli [--no-mic] [--no-system] [--room] [--no-echo-cancel] [--mic <id>] [--system <id>] [--model <id>] [--threads N]\n          [--title <text>] [--replay-mic a.wav] [--replay-system b.wav] [--speed N]");
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument {other}"),

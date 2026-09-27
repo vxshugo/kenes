@@ -30,6 +30,16 @@ describe("parseMarkdown", () => {
     expect(b[0]).toMatchObject({ t: "table", rows: [[[{ t: "text", v: "я" }], [{ t: "text", v: "оценка" }]]] });
     expect(b[1].t).toBe("quote");
   });
+  it("never drops nested items when a second nested run follows under the same item", () => {
+    const words = (l: ListBlock | null | undefined): string[] =>
+      (l?.items ?? []).flatMap((it) => [...it.c.map((n) => (n.t === "text" ? n.v : "")), ...words(it.children)]);
+    // Indentation that steps back but stays nested, and an ordered run followed by bullets.
+    for (const md of ["- Задачи\n    - первая\n  - вторая\n- Итог", "- Задачи\n  1. первая\n  - вторая\n- Итог"]) {
+      const b = parseMarkdown(md);
+      expect(b).toHaveLength(1);
+      expect(words(b[0] as ListBlock)).toEqual(["Задачи", "первая", "вторая", "Итог"]);
+    }
+  });
   it("keeps line breaks inside paragraphs", () => {
     const b = parseMarkdown("Сәлеметсіз бе\n*Здравствуйте*");
     expect(b).toHaveLength(1);

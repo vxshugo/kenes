@@ -1,10 +1,12 @@
 [package]
 name = "kenes-aec"
+description = "Acoustic echo cancellation for the mic stream, with system audio as the far-end reference"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 kenes-types = { workspace = true }
-anyhow = { workspace = true }
 log = { workspace = true }
+# Pure-Rust port of WebRTC's audio processing module; only its AEC3 echo canceller is used.
+sonora = "0.2"

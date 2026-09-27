@@ -427,6 +427,31 @@ mod tests {
     }
 
     #[test]
+    fn delete_cascades_to_every_child_table() {
+        let store = Store::open_in_memory().unwrap();
+        let m = store.create_meeting("x", "").unwrap();
+        let keep = store.create_meeting("y", "").unwrap();
+        for id in [&m.id, &keep.id] {
+            store.save_segment(id, &seg("mic-1", Source::Mic, 0, "a")).unwrap();
+            store.save_note(id, "summary", "b", None).unwrap();
+            store.rename_speaker(id, "sys:1", "Айдос").unwrap();
+            store.save_embedding(id, "mic-1", &[1.0, 0.0]).unwrap();
+        }
+        store.delete_meeting(&m.id).unwrap();
+        for table in ["segments", "notes", "speaker_names", "segment_embeddings"] {
+            let (gone, kept): (i64, i64) = store
+                .conn()
+                .query_row(
+                    &format!("SELECT SUM(meeting_id = ?1), SUM(meeting_id = ?2) FROM {table}"),
+                    params![m.id, keep.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((gone, kept), (0, 1), "{table}");
+        }
+    }
+
+    #[test]
     fn kv_upsert() {
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.get_kv("k").unwrap(), None);

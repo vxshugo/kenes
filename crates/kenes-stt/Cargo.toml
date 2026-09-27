@@ -12,6 +12,10 @@ log = { workspace = true }
 serde = { workspace = true }
 # Pinned exactly: the segmentation logic mirrors this version's VAD internals.
 sherpa-onnx = "=1.13.8"
+# GigaAM on ONNX Runtime (src/gigaam.rs). `alternative-backend` means `ort` neither links nor
+# downloads an ONNX Runtime: it is handed the one sherpa-onnx already links statically.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "alternative-backend", "api-17"] }
+realfft = "3"
 ureq = { version = "2.12", default-features = false, features = ["tls", "proxy-from-env"] }
 sha2 = "0.10"
 dirs = "6"
@@ -21,3 +25,6 @@ env_logger = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 serde_json = { workspace = true }
+# Only for tests/real_models.rs: the speaker embedder in the same process as the ONNX
+# Runtime backend (kenes-speakers depends on this crate; dev-dependency cycles are allowed).
+kenes-speakers = { workspace = true }

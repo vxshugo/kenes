@@ -25,6 +25,17 @@ describe("settings migration", () => {
     expect(normalizeSettings({ autoHintMode: "sometimes" }).autoHintMode).toBe("any");
   });
 
+  it("new keys: echo cancellation, GNOME always-on-top and global shortcuts default on", () => {
+    const s = normalizeSettings({});
+    expect(s.echoCancellation).toBe(true);
+    expect(s.gnomeAlwaysOnTop).toBe(true);
+    expect(s.globalHotkeys).toBe(true);
+    expect(s.hotkeys).toEqual({ hint: "CommandOrControl+Alt+Enter", recap: "CommandOrControl+Alt+KeyK", toggle: "CommandOrControl+Alt+KeyP" });
+    const off = normalizeSettings({ echoCancellation: false, gnomeAlwaysOnTop: false, globalHotkeys: false });
+    expect([off.echoCancellation, off.gnomeAlwaysOnTop, off.globalHotkeys]).toEqual([false, false, false]);
+    expect(normalizeSettings({ echoCancellation: "yes" }).echoCancellation).toBe(true);
+  });
+
   it("drops the legacy key but keeps other unknown keys", () => {
     const s = normalizeSettings({ autoHints: false, rustOnly: { x: 1 } }) as unknown as Record<string, unknown>;
     expect(s.autoHints).toBeUndefined();

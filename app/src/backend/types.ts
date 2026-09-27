@@ -1,6 +1,11 @@
 import type {
   DeviceInfo,
   EnrollResult,
+  HotkeyAction,
+  HotkeyConfig,
+  HotkeyStatus,
+  LiveSession,
+  PlatformInfo,
   Meeting,
   MeetingSummary,
   ModelInfo,
@@ -19,6 +24,8 @@ export interface Backend {
   listModels(): Promise<ModelInfo[]>;
   startSession(title: string, context: string): Promise<{ meetingId: string }>;
   stopSession(): Promise<void>;
+  /** The running session, if any (`SessionManager::live()`), so a reloaded UI can reattach. */
+  sessionStatus(): Promise<LiveSession | null>;
   getSettings(): Promise<Settings>;
   saveSettings(settings: Settings): Promise<void>;
   getApiKey(): Promise<string | null>;
@@ -33,7 +40,14 @@ export interface Backend {
   enrollVoice(seconds: number): Promise<EnrollResult>;
   voiceprintStatus(): Promise<VoiceprintStatus>;
   clearVoiceprint(): Promise<void>;
+  /** Applies the global-shortcut settings; resolves when the system answered (the portal may ask first). */
+  configureHotkeys(config: HotkeyConfig): Promise<HotkeyStatus>;
+  platformInfo(): Promise<PlatformInfo>;
 
   /** Subscribes to `kenes://event`. Resolves to an unsubscribe function. */
   onEvent(handler: (event: PipelineEvent) => void): Promise<() => void>;
+  /** Subscribes to `kenes://hotkey` (a system-wide shortcut fired). */
+  onHotkey(handler: (action: HotkeyAction) => void): Promise<() => void>;
+  /** Subscribes to `kenes://hotkey-status` (bindings changed, e.g. in the system settings). */
+  onHotkeyStatus(handler: (status: HotkeyStatus) => void): Promise<() => void>;
 }

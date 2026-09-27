@@ -30,5 +30,15 @@ anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 keyring = { version = "3.6", features = ["apple-native", "sync-secret-service", "crypto-rust"] }
+tokio = { version = "1", features = ["sync", "time", "macros"] }
+
+# System-wide shortcuts on macOS and X11 (see src/hotkeys.rs).
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-global-shortcut = "2"
+
+# Wayland: the XDG GlobalShortcuts portal (pure Rust over zbus).
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts"] }
+futures-util = "0.3"
 
 

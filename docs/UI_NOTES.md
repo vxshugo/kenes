@@ -19,7 +19,10 @@ keeps settings, meetings, notes, speaker names, the voiceprint and the API key i
 The key can also come from `VITE_ANTHROPIC_API_KEY` in `app/.env.local`. Add `?mockSpeed=3` to the
 URL to replay faster; the silence wait and debounces stay wall-clock, so some auto hints only show
 up at speed 1. The mock's default settings (and only those) set `myNames: ["Хуго"]`, the name the
-script addresses the user by.
+script addresses the user by. A running mock meeting survives a page reload like a real one survives a
+webview reload: its state is in `localStorage` (`kenes.mock.live`, with a 1 s heartbeat), and the next page
+reattaches and continues the script. A record without a heartbeat for 30 s belongs to a closed tab; that
+meeting is ended instead.
 
 ## File map
 
@@ -29,23 +32,30 @@ app/src/
   types.ts                       contract types (Segment, PipelineEvent, Settings, Speaker, ...) + defaults/normalizer/migration
   backend/
     types.ts                     Backend interface: every command + onEvent()
-    tauri.ts                     invoke()/listen("kenes://event"); tolerates a get_meeting without `speakers`
+    tauri.ts                     invoke()/listen("kenes://event", "kenes://hotkey"…); tolerates a get_meeting without `speakers`
     mock.ts, mockScript.ts       browser stand-in: 10-person scripted meeting, labels per format (MockDiarizer),
-                                 relabel on stop, rename_speaker, enroll_voice (20 s, stored in localStorage)
+                                 relabel on stop, rename_speaker, enroll_voice (20 s, stored in localStorage),
+                                 a running meeting that survives reloads (session_status), simulateHotkey()
     index.ts                     getBackend(): Tauri if isTauri() / __TAURI_INTERNALS__, else mock
   llm/                           framework-free, unit-tested
     client.ts                    SDK client factory, model capabilities, request params (+ structured output), streaming, Russian errors
     prompts.ts                   frozen system prompt, context block (format, user's names), transcript formatting, rename notes
     speakers.ts                  labels → default names, SpeakerDirectory (custom names), colors, talk-time stats, relabel
-    conversation.ts              per-meeting append-only message log with cache breakpoints and rename notes (+ fork, final request)
+    conversation.ts              per-meeting append-only message log with cache breakpoints and rename notes (+ fork, final request,
+                                 rollover to a new log seeded with the summary when the context fills up)
+    budget.ts                    context windows per model, rollover thresholds, request size estimates
+    usage.ts                     prices per model, per-meeting token/cache/cost totals
     tasks.ts                     task texts (hint with SKIP, ask, explain, translate, recap, rolling, final), names map, budgets
     triggers.ts                  question detector (ru/kk), name matching with case endings, auto-hint modes, silence watch,
                                  rolling-summary and suggestion timers
     suggestions.ts               speaker-name suggestions: side request, JSON schema, validation
-    copilot.ts                   runs tasks against a Conversation: serialized live queue, fork, final, side requests
+    copilot.ts                   runs tasks against a Conversation: serialized live queue, fork, final, side requests;
+                                 reports usage, asks for a fresh summary near the limit, rolls over past it
     *.test.ts                    vitest
   session/
-    controller.ts                SessionController: backend events, transcript, speakers, triggers, cards, summaries, notes
+    controller.ts                SessionController: backend events, transcript, speakers, triggers, cards, summaries, notes,
+                                 reattach after a reload, usage totals, global-shortcut actions
+    restore.ts                   pure helpers for reattach: notes → cards, phase, mic mode, usage in localStorage
     controller.test.ts           end-to-end with the mock backend and a fake Claude client
     useController.ts             singleton + useSyncExternalStore hook
   components/
@@ -55,22 +65,25 @@ app/src/
     LiveTab.tsx                  hint cards, participants panel, transcript, action bar, ask input
     Speakers.tsx                 SpeakerName (inline rename), ParticipantsList, SuggestionChips
     HintCard.tsx, Transcript.tsx live partials replaced by id, speaker headers in colors, auto-scroll + "К живому"
-    SummaryTab.tsx               rolling + final summary, copy Markdown, download .md, regenerate
+    SummaryTab.tsx               rolling + final summary, copy Markdown, download .md, regenerate, «Расход Claude»
     HistoryTab.tsx               meeting view with participants (renamable) and named transcript, export, delete
     SettingsTab.tsx              API key, model, efforts, my names, auto-hint mode, rolling interval, language, profile,
-                                 STT, capture + mic mode, «Мой голос» (voiceprint)
+                                 STT, capture + mic mode + «Подавление эха», «Мой голос» (voiceprint)
+    HotkeysSection.tsx           «Окно и горячие клавиши»: GNOME always-on-top, global shortcuts with a key recorder
     Markdown.tsx, Icons.tsx
   lib/
     meetingFormat.ts             the three meeting formats ↔ capture settings
     markdown.ts                  small Markdown subset parser (no HTML passthrough, so no sanitizing needed)
-    clipboard.ts, format.ts, keys.ts
+    clipboard.ts, format.ts
+    keys.ts                      in-app shortcut labels; accelerator recording and display for global shortcuts
   test/helpers.ts                in-memory localStorage, fake streaming Claude client, waitFor
 ```
 
 Keyboard shortcuts, also shown in tooltips (Mod = Ctrl on Linux, ⌘ on macOS):
 Mod+Enter "Что ответить?", Mod+K focus "Спросить…", Mod+Shift+E explain the selected text,
-Mod+Shift+U translate, Mod+Shift+K "Кратко: 5 мин", Alt+1…4 switch tabs. They only work while the
-Kenes window has focus (see the global-shortcut item under Rust-side needs).
+Mod+Shift+U translate, Mod+Shift+K "Кратко: 5 мин", Alt+1…4 switch tabs. These work while the Kenes
+window has focus. System-wide shortcuts (see «Window and global shortcuts» below) add «Что ответить?»,
+«Кратко: 5 мин» and show/hide while the call has focus; defaults Mod+Alt+Enter, Mod+Alt+K, Mod+Alt+P.
 
 ## Claude layer
 
@@ -154,6 +167,45 @@ user:      [speaker_names?, update₂, task₂ ◆]          ◆ = cache_control
   means "Сгенерировать заново" reads it back.
 - Changing the model or effort mid-meeting is allowed, but it invalidates the cache (caches are per
   model).
+
+### Long meetings: rollover (`budget.ts`, `Conversation.rollover`)
+
+The live log only grows. Opus 5 has 1M tokens of context, which a meeting won't fill, but Claude Haiku
+4.5 (200K) and older models could after several hours. Before every live turn and every rolling-summary
+fork the copilot estimates the request (prompt + `max_tokens`):
+- The estimate uses the meeting's own tokens-per-character ratio, measured from the last response's
+  `usage` (`input + cache_read + cache_creation` over the request's characters); 0.5 before the first
+  response.
+- Past 55% of the model's window it asks for a fresh rolling summary (at most once a minute).
+- Past 70% it rolls over. A new log starts with the same frozen system prompt and context block (their
+  cache still hits), then an `<earlier_in_meeting>` block ◆ with the latest rolling summary, the newest
+  transcript lines that fit 20% of the window (rendered with current names), and the names map. Every
+  final is in that tail or older than it, so nothing stays pending. The name state restarts from the
+  current names. It never happens while a live turn waits for its reply.
+- The log is append-only within each epoch; tests check the prefix property on both sides of a rollover,
+  and the rollover itself (through a fake API that reports large `usage`).
+- The final summary gets the same treatment: if the full transcript would pass 70% of the window, it is
+  replaced by the summary plus the newest lines.
+- A short info toast says when it happened; «Расход Claude» counts rollovers.
+
+Server-side compaction (`compact-2026-01-12`) was considered: the docs offer it for Opus/Sonnet 4.6+ and
+Fable, not for Haiku 4.5, which is the model this guards against. It also needs the full response content
+(compaction blocks) replayed, while this log stores assistant turns as text, and it would summarize on the
+server's terms instead of reusing the rolling summary and the names map.
+
+### Usage and cost (`usage.ts`)
+
+Every response's `usage` (live, fork, final, name suggestions) adds up per meeting: uncached input,
+cache writes, cache reads, output (thinking included), requests, the largest live prompt, rollovers.
+The Summary tab shows «Расход Claude»: requests, all input tokens, the share read from the cache
+(`cache_read_input_tokens` over all input), output and ≈ cost, with a detail line. The cost uses the
+price table in the Claude API docs for the model that answered (a server-side fallback may differ):
+input, 1.25× input for 5-minute cache writes, the cache-read price, output. Models without a known price
+are counted and marked with «+». Totals are kept per meeting in `localStorage` (`kenes.usage.<id>`), so a
+reload doesn't reset them; they are not stored in the meeting database.
+
+On the first real API run this is where caching shows up: the share from the cache should grow turn over
+turn (writes should be roughly the last turn's size).
 
 ### Triggers (`triggers.ts`)
 
@@ -265,6 +317,57 @@ what when it matters.
   meeting the controller still holds is renamed through it), a named and colored transcript. The mic
   mode of a stored meeting is inferred (any "mic:N" label → room).
 
+## Reattach after a webview reload
+
+On start-up the controller subscribes to events, holds them in a buffer, and calls `session_status`.
+If a session is running it loads `get_meeting` and restores:
+- the transcript (stored finals), speaker names (`speakers[].name`) and the mic mode (any "mic:N" label
+  means room);
+- hint cards from saved `hint` notes (label and detail from the note's `trigger`), the latest rolling
+  summary note, a final summary note if any;
+- the timer from `startedAt`, the phase from the session state (`idle` with a live session means it
+  was just started: shown as loading), the usage totals from `localStorage`;
+- the Claude conversation: a new log with the same context block (so the system + context cache still
+  hits), with every stored final pending. The next turn sends them in one `<transcript_update>`; if that
+  is too long for the model, the rollover above seeds it from the stored rolling summary instead.
+Then the buffered events are replayed (segments are deduplicated by id) and the session goes on as
+usual, including Stop and the final summary. What is not restored: cards that were streaming at reload
+time, name suggestions and rejections, partials.
+
+## Window and global shortcuts
+
+Settings → «Окно и горячие клавиши».
+
+**Always on top on GNOME Wayland** (`gnomeAlwaysOnTop`, default on). GNOME ignores "keep above" from
+Wayland clients. Checked on this machine (Ubuntu 26.04, GNOME 50.1, Wayland, 167% scale): run under
+XWayland (`GDK_BACKEND=x11`), the window gets `_NET_WM_STATE_ABOVE` set by Mutter (`xprop`), i.e. the
+compositor accepted it. So the shell sets `GDK_BACKEND=x11` before GTK starts when the session is
+Wayland, the desktop is GNOME, XWayland is there (`DISPLAY`), the setting is on and the user didn't set
+`GDK_BACKEND` themselves. Trade-offs:
+- GTK3/WebKitGTK under X11 only scale by whole numbers. At 167% the window renders at 200% (840×1440 X
+  pixels for the 420×720 window), so it looks about 20% larger. Ubuntu's default `xwayland-native-scaling`
+  keeps it sharp; without that experimental feature it would be blurry.
+- It applies after a restart (the backend is chosen before any window exists).
+- Global shortcuts still need the portal: an X11 key grab only sees keys while an X11 window has focus.
+- With the setting off, the window is a normal Wayland window; Alt+Space → «Поверх всех окон» pins it by
+  hand.
+
+**Global shortcuts** (`globalHotkeys`, `hotkeys`, default on). The UI calls `configure_hotkeys` at
+start-up and after every settings save; the shell emits `kenes://hotkey`, and the controller runs
+«Что ответить?» or «Кратко: 5 мин» (then the app switches to the Live tab). Outside a meeting it only
+shows a toast. The show/hide action is done by the shell.
+- Wayland (GNOME, KDE, …): the XDG GlobalShortcuts portal. The system shows its own dialog the first
+  time and may bind other keys; the ones in Settings are suggestions. The screen shows what the system
+  reports («в системе: …»). To change them later: GNOME Settings → Apps → Kenes. If the dialog is
+  dismissed, it is not reopened on every start (remembered in `localStorage`); «Назначить сочетания»
+  asks again.
+- macOS and X11: `tauri-plugin-global-shortcut` registers exactly the configured keys; a combination
+  taken by another app is reported in Settings.
+- Without a portal (or in the browser mock) the status says so and the in-app shortcuts keep working.
+
+The key recorder takes a modifier other than Shift plus one key (letters, digits, F1–F24, arrows,
+Enter, Space, …) and stores `KeyboardEvent.code` names, which both backends understand.
+
 ## Meeting format and settings
 
 - The pre-start sheet offers three formats and saves them with `save_settings` right away (the Start
@@ -308,7 +411,8 @@ No Tauri plugins are required. Clipboard, downloads and file reading use web API
    `autoHintMode` wins) but can be removed. `start_session` must read `micMode` from the saved
    settings: the UI saves the chosen format right before calling it.
 5. **`get_api_key`** returns `null` when no key is set. `set_api_key("")` is used to delete the key.
-6. **Window options** (suggestions): the current 420×720 always-on-top window is right.
+6. **Window options**: the 420×720 always-on-top window. On GNOME Wayland "on top" needs XWayland
+   (`gnomeAlwaysOnTop`, see «Window and global shortcuts»).
    - Consider `"visibleOnAllWorkspaces": true` on macOS, so the panel stays over a fullscreen call.
    - Wider windows switch to a two-column layout (transcript | hints) at ≥ 780 px.
 7. **Optional plugins**, only if the web fallbacks turn out not to work on a platform:
@@ -317,8 +421,8 @@ No Tauri plugins are required. Clipboard, downloads and file reading use web API
      always available through «Копировать Markdown».
    - `tauri-plugin-clipboard-manager`, if `navigator.clipboard` is blocked in WebKitGTK. The UI
      already falls back to `execCommand("copy")`.
-   - `tauri-plugin-global-shortcut`, for a system-wide "Что ответить?" while the call app has focus.
-     The UI would need a small hook for it.
+   - (Done) global shortcuts: `tauri-plugin-global-shortcut` on macOS/X11 and the XDG portal on Wayland,
+     see «Window and global shortcuts».
 8. **Speakers**, as the UI relies on them (all per `docs/CONTRACT.md`):
    - `Segment.speaker` only on finals; partials carry `null`. Labels exactly `"me"`, `"sys:N"`,
      `"mic:N"` (N from 1, per prefix, never reused) or `null`. In `micMode: "me"` every mic final is
@@ -348,10 +452,11 @@ No Tauri plugins are required. Clipboard, downloads and file reading use web API
   flow with renames, the suggestion request's `output_config.format`, the 429 and refusal paths),
   and in unit tests. The first real run should confirm that `fallbacks: "default"` is accepted for
   the account, that `output_config.format` with the suggestion schema (it has `description` fields)
-  is accepted together with adaptive thinking at low effort, and that `cache_read_input_tokens`
-  grows turn over turn (`StreamOutcome.usage` carries it; it isn't shown in the UI yet).
-- The UI doesn't reattach to a session that is already running after a webview reload. Stop it with
-  «Завершить» after the start error.
+  is accepted together with adaptive thinking at low effort, and that the cache share in «Расход
+  Claude» grows turn over turn.
+- Reattach restores what is stored. Cards that were streaming during the reload, name suggestions and
+  partials are lost, and the first Claude turn after a reattach re-sends the whole stored transcript
+  (one cache write).
 - Question detection is lexical. It misses questions with no marker at all ("это реально", «а по
   срокам что»), and can fire on long statements that start with «как/что». In "addressed" mode the
   name rule and Claude's SKIP limit the noise; in "any" mode the 20 s debounce does.
@@ -364,8 +469,11 @@ No Tauri plugins are required. Clipboard, downloads and file reading use web API
 - Name suggestions depend on the dialogue containing names; with 10–15 people many labels stay
   unnamed. Online clustering can split one person into two labels; both show in the panel until the
   end-of-meeting re-clustering merges them.
-- Shortcuts are window-local (see the global-shortcut item above).
-- Very long meetings are not compacted. That is fine within Opus 5's 1M-token context, but a
-  200K-context model (Haiku 4.5) could overflow after many hours.
+- Global shortcuts: the GNOME portal path was checked up to the system dialog (host registration,
+  session, a pending `BindShortcuts`, closing it); pressing a bound key while another app has focus has
+  not been tried by a person yet. The macOS/X11 plugin path has not run (this machine is Wayland only).
+- The rollover estimate is calibrated on the last response; the first request of a meeting uses 0.5
+  tokens per character. Costs are approximate: list prices, no batch/priority tiers, fallback turns
+  priced by the model that answered.
 - The rolling summary shares `hintEffort` to keep the cache warm. Only the final summary uses
   `summaryEffort`.

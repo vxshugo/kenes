@@ -40,10 +40,23 @@ Status as of 2026-09-27. Each item says what is wrong or missing, how we know, a
 - **The real Claude API has not been called yet.** Hints, summaries, name suggestions (structured
   output), server-side fallbacks and caching were only checked with a stubbed `fetch`. The first real run should
   confirm that `fallbacks: "default"` is accepted, that `output_config.format` works together with adaptive
-  thinking, and that `cache_read_input_tokens` grows turn over turn.
-- **Always-on-top on GNOME Wayland.** GNOME ignores the request from normal windows. Workaround: the
-  window menu's "Always on Top".
-- **Global hotkeys.** Shortcuts only work while the window has focus. `tauri-plugin-global-shortcut`
-  is X11-only; on Wayland the XDG GlobalShortcuts portal (`ashpd`) is the way.
-- **No reattach after a webview reload** in the middle of a session.
+  thinking, and that `cache_read_input_tokens` grows turn over turn (Summary tab → «Расход Claude» shows
+  the cache share and an approximate cost per meeting).
+- **Always-on-top on GNOME Wayland** works by running under XWayland (`gnomeAlwaysOnTop`, default on):
+  Mutter then accepts `_NET_WM_STATE_ABOVE` (checked with `xprop` on GNOME 50). Limits: at fractional
+  scaling the window renders at the next whole scale (about 20% larger at 167%), and the setting applies
+  after a restart. Off, the window is native Wayland and has to be pinned via Alt+Space. Other Wayland
+  compositors keep native Wayland; whether they honour "above" is untested.
+- **Global hotkeys** («Что ответить?», «Кратко: 5 мин», show/hide) work while the call has focus: the XDG
+  GlobalShortcuts portal on Wayland, `tauri-plugin-global-shortcut` on macOS/X11. On GNOME the portal
+  needs an app id, so the app registers as `kz.kenes.app` and writes a desktop entry for it if none
+  exists. Checked here up to GNOME's binding dialog; a key press from another app still needs a manual
+  test on GNOME, and the macOS/X11 path has not run yet. Dev builds write a hidden (`NoDisplay`) entry,
+  which GNOME Settings → Apps may not list for rebinding.
+- **Reattach after a webview reload**: `session_status` + `get_meeting` restore the transcript, names,
+  hints, rolling summary, timer and usage, and rebuild the Claude conversation from the stored
+  transcript. Streaming cards, name suggestions and partials at reload time are lost.
+- **Long meetings** roll the Claude conversation over to a new one seeded with the rolling summary
+  before it passes 70% of the model's context window (matters for 200K models such as Haiku 4.5). Not
+  yet tried against the real API.
 - **Packaging.** macOS notarization and Linux AppImage/deb have not been built yet.

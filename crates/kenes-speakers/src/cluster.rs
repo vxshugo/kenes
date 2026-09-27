@@ -187,7 +187,8 @@ impl OnlineClusterer {
 
     /// Enable the `"me"` label: segments matching this embedding (the enrolled user's voice,
     /// from [`crate::Embedder::embed`]) are labeled `"me"`. Replaces an earlier voiceprint.
-    /// A zero or non-finite embedding is ignored.
+    /// A zero or non-finite embedding is ignored, and so is one whose length differs from
+    /// the segment embeddings (e.g. enrolled with another model), whichever comes first.
     pub fn set_voiceprint(&mut self, embedding: Vec<f32>) {
         let Some(vp) = normalized(&embedding) else {
             log::warn!("ignoring an empty or invalid voiceprint");
@@ -201,8 +202,12 @@ impl OnlineClusterer {
             );
             return;
         }
-        self.dim = Some(vp.len());
+        // `dim` stays unset: segment embeddings decide it, so a voiceprint enrolled with
+        // another model is dropped by the first embedding instead of rejecting all of them.
         if let Some(me) = self.speakers.iter_mut().find(|s| s.is_me) {
+            if me.sum.len() != vp.len() {
+                me.sum = vec![0.0; vp.len()];
+            }
             me.centroid = vp;
         } else {
             self.speakers.insert(
@@ -280,7 +285,22 @@ impl OnlineClusterer {
             }
         }
         let e = normalized(e)?;
-        self.dim = Some(e.len());
+        if self.dim.is_none() {
+            self.dim = Some(e.len());
+            // Only the voiceprint can exist before the first embedding.
+            if let Some(i) = self
+                .speakers
+                .iter()
+                .position(|s| s.centroid.len() != e.len())
+            {
+                log::warn!(
+                    "voiceprint has {} dims but embeddings have {}; ignoring it (re-enroll)",
+                    self.speakers[i].centroid.len(),
+                    e.len()
+                );
+                self.speakers.remove(i);
+            }
+        }
         Some(e)
     }
 
@@ -723,6 +743,40 @@ mod tests {
             "wrong dim"
         );
         assert_eq!(c.num_speakers(), 1);
+    }
+
+    #[test]
+    fn voiceprint_from_another_model_is_dropped_not_fatal() {
+        // A voiceprint enrolled with an older model (other dimension) must not make every
+        // real embedding of the meeting "the wrong size".
+        let mut c = OnlineClusterer::new("mic", cfg());
+        c.set_voiceprint(vec![0.5; DIM / 2]);
+        assert_eq!(
+            c.assign(Some(&voice(0, 0.0)), 0, 3000).as_deref(),
+            Some("mic:1")
+        );
+        assert!(!c.has_voiceprint());
+        assert_eq!(
+            c.assign(Some(&voice(0, 0.1)), 3000, 6000).as_deref(),
+            Some("mic:1")
+        );
+        assert_eq!(
+            c.assign(Some(&voice(4, 0.0)), 6000, 9000).as_deref(),
+            Some("mic:2")
+        );
+        // A voiceprint of the model in use still works afterwards.
+        c.set_voiceprint(voice(8, 0.0));
+        assert_eq!(
+            c.assign(Some(&voice(8, 0.1)), 9000, 12000).as_deref(),
+            Some("me")
+        );
+        // Set before any embedding and of the right size, it is kept.
+        let mut c = OnlineClusterer::new("mic", cfg());
+        c.set_voiceprint(voice(8, 0.0));
+        assert_eq!(
+            c.assign(Some(&voice(8, 0.1)), 0, 3000).as_deref(),
+            Some("me")
+        );
     }
 
     #[test]

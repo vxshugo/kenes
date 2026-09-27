@@ -423,9 +423,17 @@ fn spawn_stderr_drain(
     tail: Arc<Mutex<Vec<String>>>,
 ) -> Option<JoinHandle<()>> {
     let body = move || {
-        for line in BufReader::new(stderr).lines() {
-            let Ok(line) = line else { break };
-            let line = line.trim().to_string();
+        // Byte lines, decoded lossily: `lines()` stops at the first non-UTF-8 message (a
+        // legacy locale), and closing the pipe then kills the recorder with SIGPIPE.
+        let mut reader = BufReader::new(stderr);
+        let mut raw = Vec::new();
+        loop {
+            raw.clear();
+            match reader.read_until(b'\n', &mut raw) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let line = String::from_utf8_lossy(&raw).trim().to_string();
             if line.is_empty() {
                 continue;
             }
@@ -503,5 +511,35 @@ mod tests {
     fn finds_programs_in_path() {
         assert!(find_in_path("sh").is_some());
         assert!(find_in_path("definitely-not-a-program-kenes").is_none());
+    }
+
+    #[test]
+    fn stderr_drain_survives_non_utf8_lines() {
+        // A recorder message in a legacy encoding (e.g. a KOI8-R locale) must not end the
+        // drain: once the pipe's read end closes, the next stderr write kills the recorder
+        // with SIGPIPE in the middle of a meeting.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("printf 'bad \\377\\n' >&2; sleep 0.2; echo after >&2; echo alive")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        let drain = spawn_stderr_drain(Tool::Parec, Source::Mic, stderr, tail.clone());
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let status = child.wait().unwrap();
+        join_quietly(drain);
+        assert!(status.success(), "recorder died: {status}");
+        assert_eq!(out.trim(), "alive");
+        assert_eq!(*lock_tail(&tail), ["bad \u{fffd}", "after"]);
     }
 }

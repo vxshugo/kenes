@@ -14,6 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::engine::SttBackend;
+
 /// Id of the model used when the settings don't name one.
 pub const DEFAULT_MODEL: &str = "gigaam-multilingual-ctc";
 /// Id of the voice activity detector every ASR model needs.
@@ -58,6 +60,8 @@ pub(crate) struct ModelSpec {
     pub files: &'static [ModelFile],
     /// Other registry ids that must be present for this model to be usable.
     pub requires: &'static [&'static str],
+    /// What [`SttBackend::Auto`] means for this model (never `Auto` itself).
+    pub backend: SttBackend,
 }
 
 /// Community sherpa-onnx builds of GigaAM Multilingual (no official build yet).
@@ -92,6 +96,8 @@ pub(crate) const REGISTRY: &[ModelSpec] = &[
             },
         ],
         requires: &[VAD_MODEL],
+        // Trained on a 20 ms log-mel that sherpa-onnx 1.13.8 doesn't compute.
+        backend: SttBackend::Ort,
     },
     ModelSpec {
         id: "gigaam-multilingual-large-ctc",
@@ -113,6 +119,8 @@ pub(crate) const REGISTRY: &[ModelSpec] = &[
             },
         ],
         requires: &[VAD_MODEL],
+        // Trained on a 20 ms log-mel that sherpa-onnx 1.13.8 doesn't compute.
+        backend: SttBackend::Ort,
     },
     ModelSpec {
         id: "gigaam-v3-ru-ctc",
@@ -134,6 +142,8 @@ pub(crate) const REGISTRY: &[ModelSpec] = &[
             },
         ],
         requires: &[VAD_MODEL],
+        // Trained on a 20 ms log-mel that sherpa-onnx 1.13.8 doesn't compute.
+        backend: SttBackend::Ort,
     },
     ModelSpec {
         id: VAD_MODEL,
@@ -147,6 +157,7 @@ pub(crate) const REGISTRY: &[ModelSpec] = &[
             size: 643_854,
         }],
         requires: &[],
+        backend: SttBackend::Sherpa,
     },
 ];
 
@@ -541,6 +552,12 @@ mod tests {
                 assert!(m.requires.contains(&VAD_MODEL));
                 assert!(!m.languages.is_empty());
             }
+            assert_ne!(
+                m.backend,
+                SttBackend::Auto,
+                "{}: backend must be concrete",
+                m.id
+            );
         }
         assert!(spec(DEFAULT_MODEL).is_some());
         assert!(spec(VAD_MODEL).is_some_and(|m| m.kind == ModelKind::Vad));

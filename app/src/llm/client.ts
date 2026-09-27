@@ -170,15 +170,19 @@ export async function streamMessage(
     const message = await stream.finalMessage();
     return interpret(message);
   } catch (err) {
-    // The fallbacks beta is new; if this model/account rejects it, retry once without it.
+    // The fallbacks beta is new; if this model/account rejects it, retry once without it. The
+    // model is remembered only once the retry succeeds: a 400 with another cause (low credit, a
+    // prompt that is too long) fails the retry too and must not switch fallbacks off for good.
     if (err instanceof Anthropic.BadRequestError && params.fallbacks && !text) {
+      const out = await streamMessage(client, payload, { ...opts, fallbacks: false }, handlers, signal);
       fallbacksRejected.add(opts.model);
-      return streamMessage(client, payload, { ...opts, fallbacks: false }, handlers, signal);
+      return out;
     }
     // Same for structured outputs: the caller parses JSON from plain text as a fallback.
     if (err instanceof Anthropic.BadRequestError && params.output_config?.format && !text) {
+      const out = await streamMessage(client, payload, { ...opts, format: undefined }, handlers, signal);
       formatRejected.add(opts.model);
-      return streamMessage(client, payload, { ...opts, format: undefined }, handlers, signal);
+      return out;
     }
     throw err;
   }

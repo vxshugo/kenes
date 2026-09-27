@@ -4,6 +4,11 @@ import { normalizeSettings } from "../types";
 import type {
   DeviceInfo,
   EnrollResult,
+  HotkeyAction,
+  HotkeyConfig,
+  HotkeyStatus,
+  LiveSession,
+  PlatformInfo,
   Meeting,
   MeetingSummary,
   ModelInfo,
@@ -17,6 +22,8 @@ import type {
 import type { Backend } from "./types";
 
 export const EVENT_NAME = "kenes://event";
+export const HOTKEY_EVENT = "kenes://hotkey";
+export const HOTKEY_STATUS_EVENT = "kenes://hotkey-status";
 
 export class TauriBackend implements Backend {
   readonly kind = "tauri" as const;
@@ -32,6 +39,9 @@ export class TauriBackend implements Backend {
   }
   stopSession() {
     return invoke<void>("stop_session");
+  }
+  sessionStatus() {
+    return invoke<LiveSession | null>("session_status");
   }
   async getSettings(): Promise<Settings> {
     return normalizeSettings(await invoke<unknown>("get_settings"));
@@ -69,8 +79,20 @@ export class TauriBackend implements Backend {
   clearVoiceprint() {
     return invoke<void>("clear_voiceprint");
   }
+  configureHotkeys(config: HotkeyConfig) {
+    return invoke<HotkeyStatus>("configure_hotkeys", { config });
+  }
+  platformInfo() {
+    return invoke<PlatformInfo>("platform_info");
+  }
   async onEvent(handler: (event: PipelineEvent) => void) {
     return listen<PipelineEvent>(EVENT_NAME, (e) => handler(e.payload));
+  }
+  async onHotkey(handler: (action: HotkeyAction) => void) {
+    return listen<{ action: HotkeyAction }>(HOTKEY_EVENT, (e) => handler(e.payload.action));
+  }
+  async onHotkeyStatus(handler: (status: HotkeyStatus) => void) {
+    return listen<HotkeyStatus>(HOTKEY_STATUS_EVENT, (e) => handler(e.payload));
   }
 }
 
