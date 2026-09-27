@@ -1,0 +1,7 @@
+/target
+node_modules/
+dist/
+*.wav
+!crates/**/testdata/*.wav
+.env
+.DS_Store

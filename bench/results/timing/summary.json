@@ -1,0 +1,392 @@
+[
+ {
+  "model": "gigaam-ml-ctc-pt",
+  "desc": "GigaAM-Multilingual CTC 220M, official PyTorch fp32 (gigaam pkg)",
+  "threads": 4,
+  "load_s": 3.93,
+  "peak_rss_mb": 2003.9,
+  "rss_after_load_mb": 1925.0,
+  "size_mb": 842.3,
+  "rtf_all": 0.0523,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 6.665,
+    "cpu_s": 26.62,
+    "wer": 2.36,
+    "cer": 0.41,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.06,
+    "cpu_per_audio_s": 0.2396,
+    "loadavg_1m_end": 4.61
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 5.915,
+    "cpu_s": 23.64,
+    "wer": 5.81,
+    "cer": 1.59,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0457,
+    "cpu_per_audio_s": 0.1827,
+    "loadavg_1m_end": 4.7
+   }
+  }
+ },
+ {
+  "model": "gigaam-ml-large-ctc-pt",
+  "desc": "GigaAM-Multilingual large CTC 600M, official PyTorch fp32 (gigaam pkg)",
+  "threads": 4,
+  "load_s": 7.87,
+  "peak_rss_mb": 4805.8,
+  "rss_after_load_mb": 4708.4,
+  "size_mb": 2233.2,
+  "rtf_all": 0.0964,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 10.344,
+    "cpu_s": 41.36,
+    "wer": 0.47,
+    "cer": 0.07,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0931,
+    "cpu_per_audio_s": 0.3722,
+    "loadavg_1m_end": 4.02
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 12.848,
+    "cpu_s": 51.39,
+    "wer": 5.81,
+    "cer": 1.68,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0993,
+    "cpu_per_audio_s": 0.3971,
+    "loadavg_1m_end": 4.43
+   }
+  }
+ },
+ {
+  "model": "gigaam-ml-ctc-onnx-int8",
+  "desc": "GigaAM-Multilingual CTC 220M, community sherpa-onnx int8 (fgeeer77/bayaya-models)",
+  "threads": 4,
+  "load_s": 0.84,
+  "peak_rss_mb": 435.6,
+  "rss_after_load_mb": 380.2,
+  "size_mb": 214.4,
+  "rtf_all": 0.0495,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 6.147,
+    "cpu_s": 24.58,
+    "wer": 3.3,
+    "cer": 0.54,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0553,
+    "cpu_per_audio_s": 0.2212,
+    "loadavg_1m_end": 4.04
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 5.764,
+    "cpu_s": 23.05,
+    "wer": 9.03,
+    "cer": 1.93,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0445,
+    "cpu_per_audio_s": 0.1781,
+    "loadavg_1m_end": 4.84
+   }
+  }
+ },
+ {
+  "model": "gigaam-ml-large-ctc-onnx-int8",
+  "desc": "GigaAM-Multilingual large CTC 600M, community sherpa-onnx int8 (fgeeer77/bayaya-models)",
+  "threads": 4,
+  "load_s": 1.7,
+  "peak_rss_mb": 950.2,
+  "rss_after_load_mb": 887.4,
+  "size_mb": 564.2,
+  "rtf_all": 0.0931,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 10.606,
+    "cpu_s": 42.39,
+    "wer": 0.47,
+    "cer": 0.07,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0954,
+    "cpu_per_audio_s": 0.3815,
+    "loadavg_1m_end": 3.95
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 11.794,
+    "cpu_s": 47.14,
+    "wer": 5.81,
+    "cer": 1.68,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0911,
+    "cpu_per_audio_s": 0.3642,
+    "loadavg_1m_end": 4.95
+   }
+  }
+ },
+ {
+  "model": "gigaam-ml-ctc-onnx-int8-ortfeat",
+  "desc": "same community int8 ONNX as above, run with plain onnxruntime + GigaAM-exact log-mel (numpy, 20 ms window) instead of sherpa-onnx's fbank",
+  "threads": 4,
+  "load_s": 0.99,
+  "peak_rss_mb": 459.2,
+  "rss_after_load_mb": 380.6,
+  "size_mb": 214.4,
+  "rtf_all": 0.0256,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 3.022,
+    "cpu_s": 14.77,
+    "wer": 2.83,
+    "cer": 0.47,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0272,
+    "cpu_per_audio_s": 0.1329,
+    "loadavg_1m_end": 4.02
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 3.126,
+    "cpu_s": 15.17,
+    "wer": 8.39,
+    "cer": 1.84,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0242,
+    "cpu_per_audio_s": 0.1172,
+    "loadavg_1m_end": 4.32
+   }
+  }
+ },
+ {
+  "model": "gigaam-ml-large-ctc-onnx-int8-ortfeat",
+  "desc": "same community large int8 ONNX, plain onnxruntime + GigaAM-exact log-mel (numpy)",
+  "threads": 4,
+  "load_s": 1.5,
+  "peak_rss_mb": 958.4,
+  "rss_after_load_mb": 884.3,
+  "size_mb": 564.2,
+  "rtf_all": 0.0536,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 5.612,
+    "cpu_s": 25.14,
+    "wer": 0.47,
+    "cer": 0.07,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0505,
+    "cpu_per_audio_s": 0.2262,
+    "loadavg_1m_end": 4.06
+   },
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 7.285,
+    "cpu_s": 31.82,
+    "wer": 6.45,
+    "cer": 1.76,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0563,
+    "cpu_per_audio_s": 0.2459,
+    "loadavg_1m_end": 4.67
+   }
+  }
+ },
+ {
+  "model": "gigaam-v3-ru-ctc-onnx-int8",
+  "desc": "GigaAM-v3 CTC Russian-only, sherpa-onnx int8 (csukuangfj 2025-12-16)",
+  "threads": 4,
+  "load_s": 0.93,
+  "peak_rss_mb": 416.7,
+  "rss_after_load_mb": 383.9,
+  "size_mb": 214.3,
+  "rtf_all": 0.0329,
+  "sets": {
+   "fleurs_ru": {
+    "n": 10,
+    "audio_s": 111.12,
+    "proc_s": 3.655,
+    "cpu_s": 14.6,
+    "wer": 0.47,
+    "cer": 0.07,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0329,
+    "cpu_per_audio_s": 0.1314,
+    "loadavg_1m_end": 3.81
+   }
+  }
+ },
+ {
+  "model": "whisper-kaz-rus-ct2-int8",
+  "desc": "abilmansplus/whisper-turbo-kaz-rus-v1 (LoRA merged) -> CTranslate2 int8, greedy, auto-lang",
+  "threads": 4,
+  "load_s": 1.15,
+  "peak_rss_mb": 1630.2,
+  "rss_after_load_mb": 960.4,
+  "size_mb": 785.9,
+  "rtf_all": 1.5095,
+  "sets": {
+   "fleurs_ru": {
+    "n": 5,
+    "audio_s": 55.92,
+    "proc_s": 88.074,
+    "cpu_s": 334.13,
+    "wer": 7.29,
+    "cer": 1.13,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 1.575,
+    "cpu_per_audio_s": 5.9751,
+    "loadavg_1m_end": 5.82
+   },
+   "fleurs_kk": {
+    "n": 5,
+    "audio_s": 56.82,
+    "proc_s": 82.111,
+    "cpu_s": 319.96,
+    "wer": 6.9,
+    "cer": 2.91,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 1.4451,
+    "cpu_per_audio_s": 5.6311,
+    "loadavg_1m_end": 5.95
+   }
+  }
+ },
+ {
+  "model": "whisper-large-v3-turbo-ct2-int8",
+  "desc": "openai whisper-large-v3-turbo via faster-whisper int8, greedy, auto-lang",
+  "threads": 4,
+  "load_s": 2.82,
+  "peak_rss_mb": 2026.8,
+  "rss_after_load_mb": 1720.2,
+  "size_mb": 1546.5,
+  "rtf_all": 1.5842,
+  "sets": {
+   "fleurs_ru": {
+    "n": 5,
+    "audio_s": 55.92,
+    "proc_s": 50.232,
+    "cpu_s": 198.47,
+    "wer": 2.08,
+    "cer": 0.28,
+    "frac_hyp_with_punct": 1.0,
+    "frac_hyp_with_upper": 1.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.8983,
+    "cpu_per_audio_s": 3.5492,
+    "loadavg_1m_end": 4.92
+   },
+   "fleurs_kk": {
+    "n": 5,
+    "audio_s": 56.82,
+    "proc_s": 128.371,
+    "cpu_s": 440.49,
+    "wer": 15.52,
+    "cer": 3.59,
+    "frac_hyp_with_punct": 0.4,
+    "frac_hyp_with_upper": 0.4,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 2.2593,
+    "cpu_per_audio_s": 7.7524,
+    "loadavg_1m_end": 20.09
+   }
+  }
+ },
+ {
+  "model": "vosk-small-kz-0.42",
+  "desc": "vosk-model-small-kz-0.42 (Kaldi, single-threaded)",
+  "threads": 4,
+  "load_s": 0.51,
+  "peak_rss_mb": 283.9,
+  "rss_after_load_mb": 228.4,
+  "size_mb": 102.0,
+  "rtf_all": 0.0707,
+  "sets": {
+   "fleurs_kk": {
+    "n": 10,
+    "audio_s": 129.42,
+    "proc_s": 9.155,
+    "cpu_s": 9.16,
+    "wer": 25.16,
+    "cer": 11.81,
+    "frac_hyp_with_punct": 0.0,
+    "frac_hyp_with_upper": 0.0,
+    "frac_hyp_with_digits": 0.0,
+    "empty_hyps": 0,
+    "rtf": 0.0707,
+    "cpu_per_audio_s": 0.0708,
+    "loadavg_1m_end": 3.9
+   }
+  }
+ }
+]

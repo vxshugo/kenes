@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kenes-types",
+    "crates/kenes-audio",
+    "crates/kenes-stt",
+    "crates/kenes-speakers",
+    "crates/kenes-aec",
+    "crates/kenes-core",
+    "app/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+kenes-types = { path = "crates/kenes-types" }
+kenes-audio = { path = "crates/kenes-audio" }
+kenes-stt = { path = "crates/kenes-stt" }
+kenes-speakers = { path = "crates/kenes-speakers" }
+kenes-aec = { path = "crates/kenes-aec" }
+kenes-core = { path = "crates/kenes-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.11"
+
+# ML inference is unusably slow unoptimized; keep deps optimized even in dev.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true

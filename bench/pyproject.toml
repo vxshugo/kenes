@@ -1,0 +1,42 @@
+[project]
+name = "kenes-asr-bench"
+version = "0.1.0"
+description = "Local ASR benchmark (ru / kk / code-switch) for the kenes meeting assistant"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2",
+    "soundfile>=0.12",
+    "jiwer>=3.1",
+    "psutil>=6",
+    "pyarrow>=18",
+    "requests>=2.32",
+    "huggingface-hub>=0.34",
+    # (b)/(c) sherpa-onnx, and plain onnxruntime for the *-ortfeat backends
+    "onnxruntime==1.23.*",
+    "sherpa-onnx==1.13.8",
+    "sherpa-onnx-core==1.13.8",  # ships libonnxruntime.so; not always pulled in transitively
+    "kaldi-native-fbank>=1.21",  # only for diagnose_features.py
+    # (a) official GigaAM (PyTorch)
+    "gigaam @ git+https://github.com/salute-developers/GigaAM@7447938d791c4f3e643386ee22c33777004293a5",
+    "torch==2.10.*",
+    "torchaudio==2.10.*",
+    # (d)/(e) whisper via CTranslate2
+    "faster-whisper>=1.2",
+    "ctranslate2>=4.6",
+    "transformers>=4.57",
+    "peft>=0.18",
+    # (f) vosk
+    "vosk>=0.3.45",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

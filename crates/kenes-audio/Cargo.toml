@@ -1,0 +1,26 @@
+[package]
+name = "kenes-audio"
+description = "Capture of microphone and system audio as two separate 16 kHz mono streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kenes-types = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+hound = "3.5"
+ctrlc = "3.5"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+serde_json = { workspace = true }
+
+# cpal's Linux backends need ALSA/PipeWire/Pulse headers, so it is only pulled in on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.18"
+
+[[bin]]
+name = "kenes-rec"
+path = "src/bin/kenes-rec.rs"

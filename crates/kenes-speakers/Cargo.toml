@@ -1,0 +1,20 @@
+[package]
+name = "kenes-speakers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Speaker embeddings, online clustering and end-of-meeting re-clustering for kenes"
+
+[dependencies]
+kenes-types = { workspace = true }
+kenes-stt = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+# Same exact version as kenes-stt: both link the same static sherpa-onnx.
+sherpa-onnx = "=1.13.8"
+
+[dev-dependencies]
+hound = "3.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"

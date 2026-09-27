@@ -1,0 +1,23 @@
+[package]
+name = "kenes-stt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kenes-types = { workspace = true }
+anyhow = { workspace = true }
+crossbeam-channel = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+# Pinned exactly: the segmentation logic mirrors this version's VAD internals.
+sherpa-onnx = "=1.13.8"
+ureq = { version = "2.12", default-features = false, features = ["tls", "proxy-from-env"] }
+sha2 = "0.10"
+dirs = "6"
+hound = "3.5"
+env_logger = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = { workspace = true }
