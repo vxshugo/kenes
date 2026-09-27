@@ -30,8 +30,12 @@ fn main() -> Result<()> {
             "--title" => title = args.next().expect("--title <text>"),
             "--mic" => core.mic_device = Some(args.next().expect("--mic <device id>")),
             "--system" => core.system_device = Some(args.next().expect("--system <device id>")),
-            "--replay-mic" => replay_mic = Some(args.next().expect("--replay-mic <file.wav>").into()),
-            "--replay-system" => replay_system = Some(args.next().expect("--replay-system <file.wav>").into()),
+            "--replay-mic" => {
+                replay_mic = Some(args.next().expect("--replay-mic <file.wav>").into())
+            }
+            "--replay-system" => {
+                replay_system = Some(args.next().expect("--replay-system <file.wav>").into())
+            }
             "--speed" => speed = args.next().expect("--speed N").parse()?,
             "-h" | "--help" => {
                 println!("kenes-cli [--no-mic] [--no-system] [--room] [--no-echo-cancel] [--mic <id>] [--system <id>] [--model <id>] [--threads N]\n          [--title <text>] [--replay-mic a.wav] [--replay-system b.wav] [--speed N]");
@@ -47,7 +51,11 @@ fn main() -> Result<()> {
     let manager = SessionManager::new(store.clone(), kenes_stt::models_dir(), sink);
 
     let input = if replay_mic.is_some() || replay_system.is_some() {
-        AudioInput::Files { mic: replay_mic, system: replay_system, speed }
+        AudioInput::Files {
+            mic: replay_mic,
+            system: replay_system,
+            speed,
+        }
     } else {
         AudioInput::Capture
     };
@@ -58,7 +66,10 @@ fn main() -> Result<()> {
     let _ = quit_rx.recv();
     eprintln!("\nОстанавливаю…");
     manager.stop()?;
-    eprintln!("Сохранено: встреча {meeting_id} в {}", data_dir.join("kenes.db").display());
+    eprintln!(
+        "Сохранено: встреча {meeting_id} в {}",
+        data_dir.join("kenes.db").display()
+    );
     Ok(())
 }
 
@@ -78,7 +89,14 @@ fn render(ev: &PipelineEvent, quit: &crossbeam_channel::Sender<()>) {
     match ev {
         PipelineEvent::Segment(s) if s.is_final => {
             let secs = s.start_ms / 1000;
-            let _ = writeln!(out, "\r\x1b[2K[{:02}:{:02}] {}: {}", secs / 60, secs % 60, label(s.source, s.speaker.as_deref()), s.text);
+            let _ = writeln!(
+                out,
+                "\r\x1b[2K[{:02}:{:02}] {}: {}",
+                secs / 60,
+                secs % 60,
+                label(s.source, s.speaker.as_deref()),
+                s.text
+            );
         }
         PipelineEvent::Segment(s) => {
             let _ = write!(out, "\r\x1b[2K\x1b[2m… {}\x1b[0m", s.text);
@@ -87,7 +105,11 @@ fn render(ev: &PipelineEvent, quit: &crossbeam_channel::Sender<()>) {
             let _ = write!(out, "\r\x1b[2KМодель {model}: {:.0}%", progress * 100.0);
         }
         PipelineEvent::Status { state, message } => {
-            let _ = writeln!(out, "\r\x1b[2K[{state:?}] {}", message.as_deref().unwrap_or(""));
+            let _ = writeln!(
+                out,
+                "\r\x1b[2K[{state:?}] {}",
+                message.as_deref().unwrap_or("")
+            );
             // Idle means the session ended on its own (replayed files ran out) or failed.
             if matches!(state, SessionState::Error | SessionState::Idle) {
                 let _ = quit.try_send(());
@@ -97,7 +119,11 @@ fn render(ev: &PipelineEvent, quit: &crossbeam_channel::Sender<()>) {
             let _ = writeln!(out, "\r\x1b[2KОшибка: {message}");
         }
         PipelineEvent::SpeakersRelabeled { changes } => {
-            let _ = writeln!(out, "\r\x1b[2KУточнены спикеры для {} реплик", changes.len());
+            let _ = writeln!(
+                out,
+                "\r\x1b[2KУточнены спикеры для {} реплик",
+                changes.len()
+            );
         }
         PipelineEvent::Level { .. } => {}
     }

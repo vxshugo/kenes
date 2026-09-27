@@ -61,7 +61,10 @@ impl AudioRing {
     fn slice(&self, start_ms: u64, end_ms: u64) -> Vec<f32> {
         let from = (start_ms * SAMPLES_PER_MS).clamp(self.start, self.end());
         let to = (end_ms * SAMPLES_PER_MS).clamp(from, self.end());
-        self.samples.range((from - self.start) as usize..(to - self.start) as usize).copied().collect()
+        self.samples
+            .range((from - self.start) as usize..(to - self.start) as usize)
+            .copied()
+            .collect()
     }
 }
 
@@ -79,7 +82,11 @@ pub struct Diarizer {
 
 impl Diarizer {
     /// `embedder: None` still labels headset-mode mic segments as "me"; everything else stays unlabeled.
-    pub fn new(embedder: Option<Embedder>, mic_mode: MicMode, voiceprint: Option<Vec<f32>>) -> Self {
+    pub fn new(
+        embedder: Option<Embedder>,
+        mic_mode: MicMode,
+        voiceprint: Option<Vec<f32>>,
+    ) -> Self {
         let cfg = ClusterConfig::default();
         let mut mic = OnlineClusterer::new("mic", cfg.clone());
         if let Some(vp) = &voiceprint {
@@ -162,7 +169,9 @@ impl Diarizer {
         let mut changed: Vec<(usize, Option<String>)> = Vec::new();
         // The voiceprint is the user at the mic; a similar voice in the call is someone else.
         for (prefix, voiceprint) in [("mic", self.voiceprint.as_deref()), ("sys", None)] {
-            let idx: Vec<usize> = (0..self.items.len()).filter(|&i| self.items[i].prefix == prefix).collect();
+            let idx: Vec<usize> = (0..self.items.len())
+                .filter(|&i| self.items[i].prefix == prefix)
+                .collect();
             if idx.is_empty() {
                 continue;
             }
@@ -174,7 +183,10 @@ impl Diarizer {
             }
         }
         changed.sort_by_key(|&(i, _)| i);
-        changed.into_iter().map(|(i, label)| (self.items[i].segment_id.clone(), label)).collect()
+        changed
+            .into_iter()
+            .map(|(i, label)| (self.items[i].segment_id.clone(), label))
+            .collect()
     }
 }
 
@@ -197,13 +209,18 @@ pub fn load_voiceprint(store: &Store) -> Result<Option<Vec<f32>>> {
 }
 
 fn stored_voiceprint(store: &Store) -> Result<Option<StoredVoiceprint>> {
-    let Some(raw) = store.get_kv(VOICEPRINT_KEY)? else { return Ok(None) };
+    let Some(raw) = store.get_kv(VOICEPRINT_KEY)? else {
+        return Ok(None);
+    };
     Ok(serde_json::from_str(&raw).ok())
 }
 
 pub fn voiceprint_status(store: &Store) -> Result<VoiceprintStatus> {
     let vp = stored_voiceprint(store)?;
-    Ok(VoiceprintStatus { enrolled: vp.is_some(), created_at: vp.map(|v| v.created_at) })
+    Ok(VoiceprintStatus {
+        enrolled: vp.is_some(),
+        created_at: vp.map(|v| v.created_at),
+    })
 }
 
 pub fn clear_voiceprint(store: &Store) -> Result<()> {
@@ -225,7 +242,12 @@ fn voiced(samples: &[f32]) -> Vec<f32> {
     levels.sort_by(f32::total_cmp);
     let floor = levels[levels.len() / 5];
     let threshold = (floor * 3.0).max(0.004);
-    frames.iter().filter(|f| rms(f) > threshold).flatten().copied().collect()
+    frames
+        .iter()
+        .filter(|f| rms(f) > threshold)
+        .flatten()
+        .copied()
+        .collect()
 }
 
 /// Records the user's voice from the mic and stores it as the "me" voiceprint.
@@ -240,11 +262,15 @@ pub fn enroll_voice(
     let seconds = seconds.clamp(5, 60);
     let model = kenes_speakers::ensure_speaker_model(models_dir, &mut |_| {})
         .context("загрузка модели голосов")?;
-    let mut embedder = Embedder::new(&model, num_threads).context("инициализация модели голосов")?;
+    let mut embedder =
+        Embedder::new(&model, num_threads).context("инициализация модели голосов")?;
 
     let (tx, rx) = crossbeam_channel::unbounded();
     let capture = kenes_audio::start_capture(
-        kenes_audio::CaptureConfig { mic: Some(kenes_audio::DeviceSel::from_option(mic_device)), system: None },
+        kenes_audio::CaptureConfig {
+            mic: Some(kenes_audio::DeviceSel::from_option(mic_device)),
+            system: None,
+        },
         tx,
     )
     .context("запуск микрофона")?;
@@ -270,7 +296,10 @@ pub fn enroll_voice(
         speech_ms as f64 / 1000.0
     );
     let embedding = embedder.embed(&speech)?;
-    let stored = StoredVoiceprint { embedding, created_at: now_iso() };
+    let stored = StoredVoiceprint {
+        embedding,
+        created_at: now_iso(),
+    };
     store.set_kv(VOICEPRINT_KEY, &serde_json::to_string(&stored)?)?;
     Ok(speech_ms)
 }
@@ -280,7 +309,11 @@ mod tests {
     use super::*;
 
     fn chunk(source: Source, start_ms: u64, len: usize, value: f32) -> AudioChunk {
-        AudioChunk { source, start_ms, samples: vec![value; len] }
+        AudioChunk {
+            source,
+            start_ms,
+            samples: vec![value; len],
+        }
     }
 
     #[test]
@@ -332,7 +365,11 @@ mod tests {
         };
         assert!(d.label(&mut seg).is_none());
         assert_eq!(seg.speaker.as_deref(), Some(ME));
-        let mut sys = Segment { id: "system-1".into(), source: Source::System, ..seg };
+        let mut sys = Segment {
+            id: "system-1".into(),
+            source: Source::System,
+            ..seg
+        };
         sys.speaker = None;
         d.label(&mut sys);
         assert_eq!(sys.speaker, None);
@@ -345,7 +382,13 @@ mod tests {
         v
     }
 
-    fn item(id: &str, prefix: &str, embedding: Vec<f32>, duration_ms: u64, online: &str) -> ClusterItem {
+    fn item(
+        id: &str,
+        prefix: &str,
+        embedding: Vec<f32>,
+        duration_ms: u64,
+        online: &str,
+    ) -> ClusterItem {
         ClusterItem {
             segment_id: id.into(),
             prefix: prefix.into(),
@@ -374,7 +417,10 @@ mod tests {
             item("mic-1", "mic", vp.clone(), 4000, "mic:1"),
             item("system-1", "sys", vp.clone(), 4000, "sys:1"),
         ];
-        assert_eq!(d.finish(), vec![("mic-1".to_string(), Some(ME.to_string()))]);
+        assert_eq!(
+            d.finish(),
+            vec![("mic-1".to_string(), Some(ME.to_string()))]
+        );
     }
 
     fn final_seg(id: &str, start_ms: u64, end_ms: u64) -> Segment {
@@ -413,12 +459,18 @@ mod tests {
         d.assign(&mut s1, Some(&a));
         d.assign(&mut s2, Some(&b));
         d.assign(&mut s3, None);
-        let online: Vec<_> = [&s1, &s2, &s3].iter().map(|s| s.speaker.clone().unwrap()).collect();
+        let online: Vec<_> = [&s1, &s2, &s3]
+            .iter()
+            .map(|s| s.speaker.clone().unwrap())
+            .collect();
         assert_eq!(online, ["mic:1", "mic:2", "mic:2"]);
         // "mic:2" is retired; the short segment must not keep it.
         assert_eq!(
             d.finish(),
-            vec![("mic-2".to_string(), Some("mic:1".to_string())), ("mic-3".to_string(), Some("mic:1".to_string()))]
+            vec![
+                ("mic-2".to_string(), Some("mic:1".to_string())),
+                ("mic-3".to_string(), Some("mic:1".to_string()))
+            ]
         );
     }
 
@@ -434,10 +486,20 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert!(!voiceprint_status(&store).unwrap().enrolled);
         store
-            .set_kv(VOICEPRINT_KEY, &serde_json::to_string(&StoredVoiceprint { embedding: vec![1.0, 0.0], created_at: "t".into() }).unwrap())
+            .set_kv(
+                VOICEPRINT_KEY,
+                &serde_json::to_string(&StoredVoiceprint {
+                    embedding: vec![1.0, 0.0],
+                    created_at: "t".into(),
+                })
+                .unwrap(),
+            )
             .unwrap();
         assert_eq!(load_voiceprint(&store).unwrap(), Some(vec![1.0, 0.0]));
-        assert_eq!(voiceprint_status(&store).unwrap().created_at.as_deref(), Some("t"));
+        assert_eq!(
+            voiceprint_status(&store).unwrap().created_at.as_deref(),
+            Some("t")
+        );
         clear_voiceprint(&store).unwrap();
         assert_eq!(load_voiceprint(&store).unwrap(), None);
     }

@@ -17,5 +17,9 @@ pub use store::{Meeting, MeetingSummary, Note, Speaker, Store};
 pub fn default_data_dir() -> PathBuf {
     std::env::var_os("KENES_DATA_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("kenes"))
+        .unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("kenes")
+        })
 }

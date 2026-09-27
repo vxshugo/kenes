@@ -4,7 +4,7 @@ import { describeError } from "../llm/client";
 import type { ControllerState } from "../session/controller";
 import { controller } from "../session/useController";
 import { defaultAutoHintMode, parseMyNames } from "../types";
-import type { AnswerLanguage, AutoHintMode, DeviceInfo, HintEffort, MicMode, ModelInfo, Settings, SummaryEffort } from "../types";
+import type { AnswerLanguage, AutoHintMode, DeviceInfo, HintEffort, MicMode, ModelInfo, Settings, SttBackend, SummaryEffort } from "../types";
 import { HotkeysSection } from "./HotkeysSection";
 import { IconEye, IconEyeOff, IconMic, IconTrash } from "./Icons";
 
@@ -371,6 +371,15 @@ export function SettingsTab({ state }: { state: ControllerState }) {
                 </option>
               ))}
             </select>
+          </label>
+          <label className="field">
+            <span className="field-label">Движок распознавания</span>
+            <select value={draft.sttBackend} onChange={(e) => set("sttBackend", e.target.value as SttBackend)}>
+              <option value="auto">Автоматически (рекомендуется)</option>
+              <option value="ort">ONNX Runtime: точные признаки GigaAM</option>
+              <option value="sherpa">sherpa-onnx: запасной вариант</option>
+            </select>
+            <span className="field-hint">Применяется со следующей встречи. Если выбранный движок не запустится, включится sherpa-onnx.</span>
           </label>
           <label className="field field-narrow">
             <span className="field-label">Потоки</span>

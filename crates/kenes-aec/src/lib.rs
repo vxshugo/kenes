@@ -40,11 +40,13 @@ const AEC3_LATENCY: usize = 128;
 pub const LATENCY_SAMPLES: usize = NEAR_DELAY + AEC3_LATENCY;
 
 const SAMPLES_PER_MS: usize = SAMPLE_RATE as usize / 1000;
-/// Where the delay tracker puts the echo inside AEC3's window when it has to move it.
-const TARGET_DELAY_MS: usize = 100;
-/// AEC3 is left alone while the tracked delay stays below this: its own search
-/// covers about 450 ms at 16 kHz.
-const NATIVE_DELAY_MS: usize = 400;
+/// AEC3 is left alone while the echo sits between these delays behind the (pre-delayed)
+/// reference: its own search covers about 0–450 ms at 16 kHz.
+const NATIVE_DELAY_MS: std::ops::Range<usize> = 30..400;
+/// Where a re-alignment puts the echo when it had drifted late (room to drift further)…
+const TARGET_LATE_MS: usize = 100;
+/// …and when it had drifted early.
+const TARGET_EARLY_MS: usize = 250;
 /// At most one reference re-alignment per this many frames (5 s).
 const REALIGN_COOLDOWN: u64 = 500;
 
@@ -66,7 +68,13 @@ pub struct AecConfig {
 
 impl Default for AecConfig {
     fn default() -> Self {
-        Self { far_silence_dbfs: -60.0, hangover_ms: 1000, track_delay: true, max_delay_ms: 1000, max_wait_ms: 150 }
+        Self {
+            far_silence_dbfs: -60.0,
+            hangover_ms: 1000,
+            track_delay: true,
+            max_delay_ms: 1000,
+            max_wait_ms: 150,
+        }
     }
 }
 
@@ -151,7 +159,13 @@ impl Coupling {
 
     fn new() -> Self {
         // Start by assuming speakers: cancelling for nothing costs less than leaking echo.
-        Self { recent: VecDeque::with_capacity(Self::WINDOW + 1), removed: 0, coupled: true, floor: None, smoothed: None }
+        Self {
+            recent: VecDeque::with_capacity(Self::WINDOW + 1),
+            removed: 0,
+            coupled: true,
+            floor: None,
+            smoothed: None,
+        }
     }
 
     fn coupled(&self) -> bool {
@@ -202,15 +216,26 @@ impl Coupling {
         let was = self.coupled;
         let n = self.recent.len();
         if self.coupled {
-            self.coupled = !(n >= Self::MIN_EVIDENCE && (self.removed as f32) < Self::OFF_BELOW * n as f32);
+            self.coupled =
+                !(n >= Self::MIN_EVIDENCE && (self.removed as f32) < Self::OFF_BELOW * n as f32);
         } else {
-            let newest = self.recent.iter().rev().take(Self::RECENT).filter(|&&e| e).count();
+            let newest = self
+                .recent
+                .iter()
+                .rev()
+                .take(Self::RECENT)
+                .filter(|&&e| e)
+                .count();
             self.coupled = newest as f32 >= Self::ON_ABOVE * Self::RECENT as f32;
         }
         if was != self.coupled {
             log::info!(
                 "echo path {}",
-                if self.coupled { "found: cancelling" } else { "not found (headphones?): mic passes through" }
+                if self.coupled {
+                    "found: cancelling"
+                } else {
+                    "not found (headphones?): mic passes through"
+                }
             );
         }
     }
@@ -293,14 +318,22 @@ impl EchoCanceller {
 
         let power = far_now.iter().map(|v| v * v).sum::<f32>() / FRAME as f32;
         let far_active = power > self.silence_power;
-        self.since_far = if far_active { 0 } else { self.since_far.saturating_add(1) };
+        self.since_far = if far_active {
+            0
+        } else {
+            self.since_far.saturating_add(1)
+        };
         if self.since_far > self.hangover_frames {
             self.coupling.track_floor(&raw);
         }
         if far_active {
             self.coupling.observe(power, &raw, &out);
         }
-        let target = if self.since_far <= self.hangover_frames && self.coupling.coupled() { 1.0 } else { 0.0 };
+        let target = if self.since_far <= self.hangover_frames && self.coupling.coupled() {
+            1.0
+        } else {
+            0.0
+        };
         if target > 0.0 || self.mix > 0.0 {
             self.stats.active_frames += 1;
         }
@@ -315,36 +348,57 @@ impl EchoCanceller {
 
     /// [`Self::process_frame`] over whole frames; a trailing partial frame is left as is.
     pub fn process(&mut self, far: &[f32], near: &mut [f32]) {
-        for (f, n) in far.as_chunks::<FRAME>().0.iter().zip(near.as_chunks_mut::<FRAME>().0) {
+        for (f, n) in far
+            .as_chunks::<FRAME>()
+            .0
+            .iter()
+            .zip(near.as_chunks_mut::<FRAME>().0)
+        {
             self.process_frame(f, n);
         }
     }
 
     pub fn stats(&self) -> AecStats {
         let s = self.apm.statistics();
-        AecStats { aec_delay_ms: s.delay_ms, erle_db: s.echo_return_loss_enhancement, ..self.stats.clone() }
+        AecStats {
+            aec_delay_ms: s.delay_ms,
+            erle_db: s.echo_return_loss_enhancement,
+            ..self.stats.clone()
+        }
     }
 
     /// The coarse tracker confirmed a delay: move the reference if the echo sits outside
     /// the range AEC3 handles well.
     fn realign(&mut self, frame: u64) {
-        let Some(delay) = self.tracker.as_ref().and_then(|t| t.estimate()) else { return };
+        let Some(delay) = self.tracker.as_ref().and_then(|t| t.estimate()) else {
+            return;
+        };
         let delay_ms = delay * FRAME / SAMPLES_PER_MS;
         self.stats.tracked_delay_ms = Some(delay_ms as u32);
         let current_ms = self.far_line.len() / SAMPLES_PER_MS;
-        let residual = delay_ms as isize - current_ms as isize;
-        if (0..NATIVE_DELAY_MS as isize).contains(&residual) {
+        let want_ms = if delay_ms >= current_ms + NATIVE_DELAY_MS.end {
+            delay_ms - TARGET_LATE_MS
+        } else if current_ms > 0 && delay_ms < current_ms + NATIVE_DELAY_MS.start {
+            // Pre-delayed too much (the delay shrank, e.g. clock drift): the echo is about
+            // to arrive before its reference, which no canceller can follow.
+            delay_ms.saturating_sub(TARGET_EARLY_MS)
+        } else {
+            return;
+        };
+        if self
+            .last_realign
+            .is_some_and(|at| frame < at + REALIGN_COOLDOWN)
+        {
             return;
         }
-        if self.last_realign.is_some_and(|at| frame < at + REALIGN_COOLDOWN) {
-            return;
-        }
-        let want_ms = delay_ms.saturating_sub(TARGET_DELAY_MS);
         let want = want_ms * SAMPLES_PER_MS / FRAME * FRAME;
         if want == self.far_line.len() {
             return;
         }
-        log::info!("echo delay {delay_ms} ms: reference pre-delay {current_ms} → {} ms", want / SAMPLES_PER_MS);
+        log::info!(
+            "echo delay {delay_ms} ms: reference pre-delay {current_ms} → {} ms",
+            want / SAMPLES_PER_MS
+        );
         if want > self.far_line.len() {
             // The reference repeats nothing: it pauses for the difference.
             for _ in self.far_line.len()..want {
@@ -367,11 +421,18 @@ fn new_aec3() -> sonora::AudioProcessing {
     use sonora::config::EchoCanceller as Aec3;
     let config = sonora::Config {
         // No high-pass filter: with the far end silent the output must equal the input.
-        echo_canceller: Some(Aec3 { enforce_high_pass_filtering: false, ..Default::default() }),
+        echo_canceller: Some(Aec3 {
+            enforce_high_pass_filtering: false,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let stream = sonora::StreamConfig::new(SAMPLE_RATE, 1);
-    let mut apm = sonora::AudioProcessing::builder().config(config).capture_config(stream).render_config(stream).build();
+    let mut apm = sonora::AudioProcessing::builder()
+        .config(config)
+        .capture_config(stream)
+        .render_config(stream)
+        .build();
     // Render and capture frames are fed pairwise from one timeline, so the only delay is
     // the acoustic one inside the signals; AEC3 estimates that itself.
     let _ = apm.set_stream_delay_ms(0);
@@ -425,7 +486,10 @@ mod tests {
         let mut out = near.clone();
         let mut aec = EchoCanceller::new(AecConfig::default());
         aec.process(&vec![0.0; near.len()], &mut out);
-        assert_eq!(&out[LATENCY_SAMPLES..], &near[..near.len() - LATENCY_SAMPLES]);
+        assert_eq!(
+            &out[LATENCY_SAMPLES..],
+            &near[..near.len() - LATENCY_SAMPLES]
+        );
         assert!(out[..LATENCY_SAMPLES].iter().all(|&v| v == 0.0));
         assert_eq!(aec.stats().active_frames, 0);
     }
@@ -434,7 +498,12 @@ mod tests {
     fn aec3_latency_matches_constant() {
         // Without pass-through (a far end that is never "silent"), AEC3 itself must
         // delay the mic by exactly LATENCY_SAMPLES; the pass-through path relies on it.
-        let cfg = AecConfig { far_silence_dbfs: -200.0, hangover_ms: 0, track_delay: false, ..Default::default() };
+        let cfg = AecConfig {
+            far_silence_dbfs: -200.0,
+            hangover_ms: 0,
+            track_delay: false,
+            ..Default::default()
+        };
         let mut aec = EchoCanceller::new(cfg);
         let near = noise(2, 100 * FRAME, 0.1);
         let far = vec![1e-9; near.len()];
@@ -443,7 +512,11 @@ mod tests {
         let (a, b) = (20 * FRAME, 90 * FRAME);
         let best = (0..400)
             .max_by(|&x, &y| {
-                let c = |lag: usize| (a..b).map(|i| near[i] as f64 * out[i + lag] as f64).sum::<f64>();
+                let c = |lag: usize| {
+                    (a..b)
+                        .map(|i| near[i] as f64 * out[i + lag] as f64)
+                        .sum::<f64>()
+                };
                 c(x).total_cmp(&c(y))
             })
             .unwrap();
@@ -486,10 +559,17 @@ mod tests {
         aec.process(&far, &mut out);
         assert!(!aec.stats().echo_path);
         let tail = n - 2 * 16_000..n;
-        assert!(tail.clone().all(|i| out[i] == mic[i - LATENCY_SAMPLES]), "not passed through untouched");
+        assert!(
+            tail.clone().all(|i| out[i] == mic[i - LATENCY_SAMPLES]),
+            "not passed through untouched"
+        );
         // Speakers again: the far end now comes back through the mic.
         let far = spurts(7, n);
-        let mic: Vec<f32> = echo(&far, 800, 0.5).iter().zip(noise(8, n, 0.002)).map(|(e, v)| e + v).collect();
+        let mic: Vec<f32> = echo(&far, 800, 0.5)
+            .iter()
+            .zip(noise(8, n, 0.002))
+            .map(|(e, v)| e + v)
+            .collect();
         let mut out = mic.clone();
         aec.process(&far, &mut out);
         assert!(aec.stats().echo_path);
@@ -512,7 +592,10 @@ mod tests {
         let mut aec = EchoCanceller::new(AecConfig::default());
         aec.process(&far, &mut out);
         let s = aec.stats();
-        assert!(s.tracked_delay_ms.is_some_and(|d| d.abs_diff(700) <= 20), "{s:?}");
+        assert!(
+            s.tracked_delay_ms.is_some_and(|d| d.abs_diff(700) <= 20),
+            "{s:?}"
+        );
         assert_eq!(s.realignments, 1, "{s:?}");
         let tail = n - 5 * 16_000..n;
         let erle = 10.0 * (energy(&echo[tail.clone()]) / energy(&out[tail]).max(1e-12)).log10();

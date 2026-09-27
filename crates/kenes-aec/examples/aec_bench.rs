@@ -18,7 +18,15 @@ fn signals(seconds: usize) -> (Vec<f32>, Vec<f32>) {
         (s >> 40) as f32 / (1u64 << 24) as f32 - 0.5
     };
     // Talk spurts: 1 s on, 0.5 s off.
-    let far: Vec<f32> = (0..n).map(|i| if i % 24_000 < 16_000 { rnd() * 0.2 } else { 0.0 }).collect();
+    let far: Vec<f32> = (0..n)
+        .map(|i| {
+            if i % 24_000 < 16_000 {
+                rnd() * 0.2
+            } else {
+                0.0
+            }
+        })
+        .collect();
     let mut near = vec![0.0f32; n];
     for i in 1_650..n {
         near[i] = 0.3 * far[i - 1_600] + 0.1 * far[i - 1_650] + rnd() * 0.002;
@@ -31,7 +39,13 @@ fn main() {
     let (far, near) = signals(seconds);
     for (name, cfg) in [
         ("AEC3 + delay tracker (default)", AecConfig::default()),
-        ("AEC3 only", AecConfig { track_delay: false, ..AecConfig::default() }),
+        (
+            "AEC3 only",
+            AecConfig {
+                track_delay: false,
+                ..AecConfig::default()
+            },
+        ),
     ] {
         let mut best = Duration::MAX;
         let mut worst_frame = Duration::ZERO;
@@ -39,7 +53,12 @@ fn main() {
             let mut aec = EchoCanceller::new(cfg.clone());
             let mut out = near.clone();
             let t = Instant::now();
-            for (f, n) in far.as_chunks::<FRAME>().0.iter().zip(out.as_chunks_mut::<FRAME>().0) {
+            for (f, n) in far
+                .as_chunks::<FRAME>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<FRAME>().0)
+            {
                 let tf = Instant::now();
                 aec.process_frame(f, n);
                 worst_frame = worst_frame.max(tf.elapsed());

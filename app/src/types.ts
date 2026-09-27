@@ -116,6 +116,9 @@ export type MicMode = "me" | "room";
  */
 export type AutoHintMode = "addressed" | "any" | "off";
 
+export const STT_BACKENDS = ["auto", "ort", "sherpa"] as const;
+export type SttBackend = (typeof STT_BACKENDS)[number];
+
 export type Settings = {
   // read by Rust
   sttModel: string;
@@ -127,6 +130,8 @@ export type Settings = {
   systemDevice: string | null;
   /** Echo cancellation of the call audio picked up by the mic (kenes-aec); matters without headphones. */
   echoCancellation: boolean;
+  /** Recognizer runtime: "auto" (per-model default, ONNX Runtime for GigaAM), "ort" or "sherpa". Next session. */
+  sttBackend: SttBackend;
   /** Read by the app shell at start-up: run under XWayland on GNOME Wayland so the window can stay on top. */
   gnomeAlwaysOnTop: boolean;
   // UI only
@@ -160,6 +165,7 @@ export const DEFAULT_SETTINGS: Settings = {
   micDevice: null,
   systemDevice: null,
   echoCancellation: true,
+  sttBackend: "auto",
   gnomeAlwaysOnTop: true,
   claudeModel: "claude-opus-5",
   hintEffort: "low",
@@ -245,6 +251,7 @@ export function normalizeSettings(raw: unknown): Settings {
     micDevice: strOrNull(r.micDevice),
     systemDevice: strOrNull(r.systemDevice),
     echoCancellation: bool(r.echoCancellation, d.echoCancellation),
+    sttBackend: oneOf(r.sttBackend, STT_BACKENDS, d.sttBackend),
     gnomeAlwaysOnTop: bool(r.gnomeAlwaysOnTop, d.gnomeAlwaysOnTop),
     claudeModel: str(r.claudeModel, d.claudeModel).trim(),
     hintEffort: oneOf(r.hintEffort, HINT_EFFORTS, d.hintEffort),

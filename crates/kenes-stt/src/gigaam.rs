@@ -2,10 +2,11 @@
 //!
 //! **Why.** sherpa-onnx 1.13.8 feeds every GigaAM model the v1/v2 front-end: a 25 ms kaldi
 //! fbank with n_fft 400. GigaAM-v3 and GigaAM-Multilingual were trained on torchaudio's
-//! `MelSpectrogram` with a 20 ms window (n_fft = win = 320, hop 160, no centre padding), and
-//! on code-switched ru/kk audio the mismatch costs 30–50 % more errors (`bench/RESULTS.md`).
-//! [`LogMel`] computes the training front-end exactly; [`GigaamOrt`] runs the same int8 ONNX
-//! file on it and decodes greedily.
+//! `MelSpectrogram` with a 20 ms window (n_fft = win = 320, hop 160, no centre padding). The
+//! mismatch shows when one decode spans a pause: on the code-switch benchmark clips decoded
+//! whole, sherpa garbles the part after the pause (CER 2.3 % vs 1.0 % here). On VAD-split
+//! utterances the two are at parity (numbers in the README). [`LogMel`] computes the training
+//! front-end exactly; [`GigaamOrt`] runs the same int8 ONNX file on it and decodes greedily.
 //!
 //! **Which ONNX Runtime.** sherpa-onnx links its own ONNX Runtime statically (1.28.2 in
 //! sherpa-onnx 1.13.8) and we still need sherpa for the Silero VAD and speaker embeddings.
@@ -209,15 +210,17 @@ pub(crate) fn init_ort() -> Result<&'static str> {
             // runtime's table is at least that long, so this copy stays in bounds.
             (version, (*api).clone())
         };
-        ort::set_api(api);
+        if !ort::set_api(api) {
+            log::debug!("`ort` already had an ONNX Runtime API set; keeping it");
+        }
         ort::init()
             .with_name("kenes-stt")
             .with_telemetry(false)
             .commit();
         // `ort` releases its environment from a `.fini_array` hook at exit, which for a
         // statically linked runtime runs after the runtime's own C++ static destructors.
-        // Keep one reference forever so that release never happens (sherpa-onnx's objects
-        // also just stay alive at exit).
+        // Keep one reference forever so that release never happens; the OS reclaims it, as it
+        // does for sherpa-onnx objects that are still alive at exit.
         let env = ort::environment::Environment::current().map_err(|e| e.to_string())?;
         std::mem::forget(env);
         log::info!("using the ONNX Runtime {version} linked by sherpa-onnx");

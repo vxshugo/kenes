@@ -62,7 +62,8 @@ environment variables change where the library comes from:
   then comes from its `libonnxruntime`, which works too.
 - `SHERPA_ONNX_ARCHIVE_DIR` points at a directory holding the archive, for offline builds.
 
-The community `sherpa-rs` crate wasn't needed. The release `kenes-transcribe` binary is 33 MB.
+The community `sherpa-rs` crate wasn't needed. The release `kenes-transcribe` binary is 34 MB
+(33 MB before `ort`).
 
 ## Models
 
@@ -94,7 +95,9 @@ Sources:
   pinned to revision `32a4c7cc`.
 - Silero VAD is `asr-models/silero_vad.onnx` from the sherpa-onnx releases.
 
-The pinned URLs and hashes are in `src/registry.rs`. `available_models()` lists only the three ASR
+The pinned URLs and hashes are in `src/registry.rs`. Each entry also names the backend `Auto`
+resolves to (`backend: SttBackend::Ort` for all three ASR models). Both backends read the same
+`model.int8.onnx` and `tokens.txt`, so switching backends downloads nothing. `available_models()` lists only the three ASR
 models. Their `sizeMb` includes the VAD.
 
 ## API
@@ -148,8 +151,12 @@ an audio buffer and a timeline.
 - **Utterance start.** The VAD's own start is `2 × window + min_speech` before the trigger. We add
   250 ms of pre-roll, but never overlap the previous utterance.
 - **Utterance end.** The end is the VAD's end of speech plus 150 ms (or 50 ms after a soft 0.1 s
-  split). Every decode also gets 0.3 s of trailing zeros, because GigaAM drops the last characters
-  when the audio stops right after the last phoneme ("марокко" became "маро").
+  split). Every decode also gets 0.3 s of trailing silence, because GigaAM drops the last
+  characters when the audio stops right after the last phoneme ("марокко" became "маро"). On the
+  `sherpa` backend that silence is zeros. On `ort` it is deterministic white noise at −70 dBFS:
+  zeros hit the exact front-end's `log(1e-9)` floor (−20.7, against about −11 for that noise),
+  far below any recorded silence, and that costs accuracy. On Common Voice kk (220M, whole clips)
+  WER was 12.1 % with zeros, 10.7 % unpadded and 8.2 % with the noise.
 - **Forced cut** at `max_segment_ms`. The cut goes at the quietest 100 ms of the last 3 s, and the
   next utterance continues from that exact sample, so no audio is lost. The VAD is not reset:
   resetting Silero mid-speech makes it miss ongoing speech for seconds (p ≈ 0.02 on clear speech).
@@ -202,8 +209,16 @@ an audio buffer and a timeline.
   - `Transcriber::new` loads the model in 1–2 s and takes ~450 MB. Run it and `ensure_model` off
     the UI thread.
   - `spawn` starts one thread named `kenes-stt`. Each decode uses `num_threads` ONNX Runtime
-    threads. ORT's thread spinning is turned off through `<models_dir>/ort-cpu.cfg`, which we write
-    and pass as `cpu:<path>`.
+    threads (intra-op; inter-op 1) on either backend. ORT's thread spinning is turned off: for
+    `ort` through session options, for sherpa-onnx through `<models_dir>/ort-cpu.cfg`, which we
+    write and pass as `cpu:<path>`.
+  - **Backend.** `Transcriber::new` uses `SttBackend::Auto`, which today means `ort` for every
+    model. To honour the `sttBackend` setting (`"auto" | "ort" | "sherpa"`), read it as a string
+    and call `Transcriber::with_backend(cfg, s.parse().unwrap_or_default())`, so that an unknown
+    value means `Auto`. If `ort` can't load the model it falls back to sherpa by itself and logs a
+    warning. `backend()` reports which one ended up running, for example for the status line.
+  - The ORT backend shares sherpa-onnx's ONNX Runtime and its environment with the VADs and
+    `kenes-speakers`' embedder, so there is nothing to initialise and no order to respect.
   - The VAD runs single-threaded on the worker.
   - With a splitter installed there is one more thread, `kenes-stt-split`, where the closure runs.
     It is not joined on shutdown, so a stuck closure can't block it.
@@ -224,7 +239,93 @@ an audio buffer and a timeline.
 
 Ubuntu 26.04, Intel Meteor Lake (18 threads). Other agents were building and benchmarking at the
 same time (load average 6–13), so treat these as upper bounds. The first number in each cell is
-from the quietest run.
+from the quietest run. The decode-time and load tables were measured on the `sherpa` backend,
+before `ort` existed. The next section compares the two backends.
+
+### `ort` vs `sherpa` backend
+
+**Features.** `examples/gigaam_features.rs` and `scripts/compare_features.py` compared `LogMel`
+with the references on 6 clips (2 kk↔ru pairs, FLEURS ru, FLEURS kk, 2 Common Voice kk; 427–1991
+frames each). Max |Δ| of the log-mel values:
+
+| against | max \|Δ\| | mean \|Δ\| |
+|---|---|---|
+| the same formulas in float64 | 9.5e-7 (f32 rounding) | 1–3e-7 |
+| `bench/run_bench.py` `GigaAMLogMel` (numpy) | 3.0e-5 to 8.7e-4 | 3e-7 to 2.3e-6 |
+| `gigaam.preprocess.FeatureExtractor` (torchaudio, what the model was trained with) | 1.6e-4 to 2.4e-3 | 2–7e-6 |
+| (numpy vs torchaudio, for scale) | 1.6e-4 to 2.5e-3 | 2–8e-6 |
+
+The int8 model amplifies differences that small. With the same onnxruntime, numpy and
+torchaudio features give different transcripts on 11 of the 210 benchmark clips (WER moves up to
+±0.35 per set), and noise realisations in the padding move cv_kk by ±0.8. Rust (ORT 1.28.2) and
+`run_bench.py` (ORT 1.23.2) differ on 12 of 210 clips, all single-letter flips at uncertain
+spots. "Match" below means within that noise.
+
+**Accuracy** (WER / CER %, `examples/bench_sets.rs`, 4 threads, scored like `run_bench.py`; the
+scores agree with its jiwer-based `score()` to the digit). Modes: *unpadded* is one decode per clip
+with nothing appended, which is what `run_bench.py` does. *whole* is `Transcriber::recognize`,
+one decode per clip plus the tail padding. *VAD* is `transcribe_buffer`, the live segmentation.
+
+| model | mode | backend | fleurs_ru | fleurs_kk | cv_kk | codeswitch |
+|---|---|---|---|---|---|---|
+| 220M | unpadded | Python ORT (`RESULTS.md` ortfeat) | 4.2 / 0.7 | 5.8 / 1.6 | 10.1 / 2.4 | 5.1 / 1.0 |
+| | | **ort** | 3.81 / 0.67 | 5.80 / 1.62 | 10.68 / 2.39 | 5.44 / 1.03 |
+| | | Python sherpa (`RESULTS.md`) | 4.0 / 0.7 | 6.1 / 1.6 | 8.8 / 2.0 | 7.5 / 2.3 |
+| | | sherpa | 3.98 / 0.72 | 6.12 / 1.65 | 8.77 / 2.00 | 7.46 / 2.27 |
+| | whole | **ort** | 3.89 / 0.68 | 5.59 / 1.62 | 8.22 / 1.83 | 5.56 / 1.04 |
+| | | sherpa | 4.06 / 0.72 | 5.80 / 1.64 | 8.49 / 2.09 | 7.46 / 2.34 |
+| | VAD | **ort** | 4.31 / 0.83 | 6.87 / 1.78 | 8.49 / 2.09 | 5.18 / 1.11 |
+| | | sherpa | 3.81 / 0.74 | 6.55 / 1.76 | 9.32 / 2.35 | 5.31 / 1.19 |
+| large 600M | unpadded | Python ORT (`RESULTS.md`) | 2.2 / 0.4 | 4.5 / 1.4 | 8.8 / 2.0 | 4.4 / 0.7 |
+| | | **ort** | 2.20 / 0.42 | 4.51 / 1.44 | 9.04 / 2.04 | 3.92 / 0.69 |
+| | | Python sherpa (`RESULTS.md`) | 2.3 / 0.4 | 4.7 / 1.5 | 7.1 / 1.5 | 5.7 / 0.8 |
+| | | sherpa | 2.37 / 0.44 | 4.62 / 1.47 | 7.12 / 1.44 | 5.69 / 0.79 |
+| | whole | **ort** | 2.20 / 0.42 | 4.51 / 1.44 | 8.49 / 1.87 | 4.42 / 0.74 |
+| | | sherpa | 2.28 / 0.43 | 4.83 / 1.47 | 7.40 / 1.57 | 5.82 / 0.82 |
+| | VAD | **ort** | 2.45 / 0.48 | 5.26 / 1.55 | 7.40 / 1.96 | 4.68 / 1.04 |
+| | | sherpa | 2.54 / 0.48 | 5.80 / 1.58 | 6.30 / 1.30 | 4.42 / 0.96 |
+| v3 ru | unpadded | **ort** / sherpa | 3.13 / 0.58 · 2.71 / 0.52 | – | – | ru half WER 7.3 · 12.3 |
+| | whole | **ort** / sherpa | 3.05 / 0.54 · 2.79 / 0.54 | – | – | ru half WER 7.8 · 14.2 |
+| | VAD | **ort** / sherpa | 3.21 / 0.60 · 3.13 / 0.61 | – | – | ru half WER 2.6 · 2.8 |
+
+Sizes: fleurs_ru 1182 words, fleurs_kk 931, cv_kk 365, codeswitch 791, so one word is 0.1, 0.1,
+0.3 and 0.13 points. Reading the table:
+
+- The Rust backends reproduce the Python benchmark rows within noise, sherpa almost to the
+  digit.
+- **One decode that spans a pause** is where `ort` wins. The code-switch clips are two FLEURS
+  sentences with their own leading and trailing silence plus 0.3 s of zeros, decoded whole.
+  sherpa's front-end garbles the part after the pause (220M: ru half WER 9.0 vs 5.9, CER 2.3 vs
+  1.0; large: 5.8 vs 4.4 WER). It isn't the zeros: filling the gap with noise gave sherpa the same
+  7.46 %. The live worker only decodes across a pause of 0.5 s or more when the VAD doesn't hear
+  it as silence (background noise, music). Offline decodes of longer audio hit it more often.
+- **The live path (VAD)** splits at 0.5 s pauses, and there the two backends are at parity. Total
+  word errors over the four sets are 187 (`ort`) vs 182 (sherpa) of 3269 for the 220M model, and
+  142 vs 142 for the large one. cv_kk swings either way by 3–4 words.
+- A kk↔ru switch *without* a pause is also at parity: 30 trimmed FLEURS kk+ru pairs joined with
+  50 ms of room noise, so the VAD keeps each pair in one utterance. VAD mode, 220M: `ort` 5.56 /
+  1.45, sherpa 5.37 / 1.62. Large: 3.83 / 1.19 vs 3.64 / 1.24.
+- `gigaam-v3-ru-ctc` on pure Russian: sherpa is 1–5 words better, which is within noise but
+  not a win for `ort`. On Russian after Kazakh, `ort` is much better.
+
+**Speed.** Same runtime, same speed. `kenes-transcribe --bench` (median of 3, 4 threads) at
+load average 1.3–2.7, backends alternating:
+
+| model | backend | 5 s | 10 s | 20 s | model load | RSS |
+|---|---|---|---|---|---|---|
+| 220M | **ort** | 0.17–0.18 s | 0.33–0.38 s (RTF 0.033–0.038) | 0.74–0.83 s | 0.72 s | 459 MB |
+| 220M | sherpa | 0.17–0.26 s | 0.34–0.48 s (RTF 0.034–0.048) | 0.74–1.04 s | 0.72 s | 455 MB |
+| large 600M | **ort** | 0.40 s | 0.77 s (RTF 0.077) | 1.62 s | 1.5 s | 955 MB |
+| large 600M | sherpa | 0.42 s | 0.78 s (RTF 0.078) | 1.89 s | 1.6 s | 997 MB |
+| v3 ru | **ort** | 0.16 s | 0.34 s (RTF 0.034) | 0.71 s | 0.85 s | 424 MB |
+| v3 ru | sherpa | 0.20 s | 0.35 s (RTF 0.035) | 0.70 s | 0.70 s | 414 MB |
+
+RSS includes the two VADs. `bench/RESULTS.md` has pip onnxruntime 1.8× faster than the
+sherpa-onnx wheel, and that doesn't reproduce here. Back to back, the sherpa-onnx wheel, pip
+onnxruntime 1.23 and both Rust backends all ran the 220M model at RTF 0.031–0.04, and the large
+model on pip onnxruntime at 0.076–0.08. Official ONNX Runtime 1.28.2 and 1.30.0 builds, loaded
+with `dlopen` in place of the bundled one (a quick experiment, not in the code), were within ~15% of
+it on the large model. So a separate runtime wouldn't buy speed either.
 
 **Decode time** for one utterance, with `kenes-transcribe --bench`:
 
@@ -246,10 +347,18 @@ from the quietest run.
 
 **Live** (`--simulate-live`, 1×, 100 ms chunks, 108 s of kk/ru speech with few pauses):
 
-| scenario | CPU | partials | partial latency | final latency |
-|---|---|---|---|---|
-| mic only | 0.9 core on average | 84 | median 0.30 s, p90 0.54 s | median 1.09 s, p90 1.27 s |
-| mic + system at once (108 s + 86 s) | 1.4 cores | 74 | median 0.39 s, p90 0.80 s | median 1.14 s, p90 1.92 s |
+| scenario | backend | CPU | partials | partial latency | final latency |
+|---|---|---|---|---|---|
+| mic only | **ort** | 0.58–0.63 core | 103–106 | median 0.15–0.16 s, p90 0.29–0.33 s | median 0.64–0.70 s, p90 0.74–0.80 s |
+| mic only | sherpa | 0.62–0.64 core | 102–103 | median 0.16 s, p90 0.30–0.35 s | median 0.67–0.73 s, p90 0.88–0.90 s |
+| mic + system at once (108 s + 86 s) | **ort** | 0.93–0.98 core | 149–154 | median 0.19 s, p90 0.35–0.37 s | median 0.67–0.69 s, p90 0.83–0.86 s |
+| mic + system at once | sherpa | 0.89–1.02 core | 139–164 | median 0.16–0.20 s, p90 0.30–0.39 s | median 0.64–0.74 s, p90 0.82–0.91 s |
+| mic only, earlier (load 6–13) | sherpa | 0.9 core | 84 | median 0.30 s, p90 0.54 s | median 1.09 s, p90 1.27 s |
+| mic + system, earlier (load 6–13) | sherpa | 1.4 cores | 74 | median 0.39 s, p90 0.80 s | median 1.14 s, p90 1.92 s |
+
+The `ort`/`sherpa` rows are two alternating rounds each at load average 1.8–4.1. The finals in
+both runs are the same text except for two words, and `ort` gets "архипелагтар" right where
+sherpa writes "архипелакгтар".
 
 - Partial latency is how old the newest audio in a partial is when the partial arrives.
 - Final latency is measured from the segment's `end_ms`. It includes the 0.5 s of silence the VAD
@@ -262,15 +371,16 @@ the benchmark's 60 FLEURS kk, 60 FLEURS ru, 60 Common Voice kk and 30 kk↔ru pa
 sentences. "Whole clip" decodes each file in one pass. "VAD split" is `transcribe_buffer`, the
 same path the live worker uses.
 
-| set | whole clip | VAD split |
-|---|---|---|
-| FLEURS kk | 1.64 % | 1.76 % |
-| FLEURS ru | 0.72 % | 0.74 % |
-| Common Voice kk | 2.09 % | 2.35 % |
-| kk↔ru pairs | 2.34 % | **1.19 %** |
+| set | whole clip, sherpa | whole clip, **ort** | VAD split, sherpa | VAD split, **ort** |
+|---|---|---|---|---|
+| FLEURS kk | 1.64 % | 1.62 % | 1.76 % | 1.78 % |
+| FLEURS ru | 0.72 % | 0.68 % | 0.74 % | 0.83 % |
+| Common Voice kk | 2.09 % | 1.83 % | 2.35 % | 2.09 % |
+| kk↔ru pairs | 2.34 % | **1.04 %** | 1.19 % | 1.11 % |
 
-Before the gain control and the VAD tuning, FLEURS kk was at 4.94 %. The pairs do better when
-split because each language gets its own decode.
+Before the gain control and the VAD tuning, FLEURS kk was at 4.94 % (sherpa). With sherpa, the
+pairs do better when split because each part gets its own decode. With `ort`, a whole-clip decode
+is already as good.
 
 ### Sample output (default model, `transcribe_buffer`)
 
@@ -360,7 +470,15 @@ With `RUST_LOG=kenes_stt=trace` it prints every VAD transition and cut.
   is empty. Speech already under way at that moment may not be detected until the next pause.
 - **Session length.** sherpa-onnx's VAD counts samples in `int32`, which overflows after ~37 h of
   continuous audio per source. This hasn't been tested.
+- **The ONNX Runtime comes with sherpa-onnx.** The `ort` backend uses whatever runtime the pinned
+  sherpa-onnx links. A sherpa-onnx upgrade therefore changes the runtime under both backends. A
+  runtime older than C API 17 (ONNX Runtime 1.17) makes `ort` fall back to sherpa.
+- **`ort` is a release candidate** (`=2.0.0-rc.13`, pinned exactly). Only its session and tensor
+  API is used, with `alternative-backend`.
 - **Not verified.**
-  - macOS. The static osx libraries exist, but nothing was built or run on a Mac.
+  - macOS. `cargo check -p kenes-stt --all-targets` passes for `aarch64-apple-darwin` and
+    `x86_64-apple-darwin`; `ring` needs a C cross compiler, and `zig cc` was used as `CC`. Both osx
+    archives define `_OrtGetApiBase` and carry ONNX Runtime 1.28.2. Nothing was linked or run on
+    a Mac.
   - The large model and `gigaam-v3-ru-ctc` in live mode, beyond `--bench`.
   - Noisy real-world microphones. The gain control was only checked against synthetic noise.

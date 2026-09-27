@@ -106,7 +106,11 @@ impl Biquad {
         let alpha = s / (2.0 * q);
         let a0 = 1.0 + alpha / a;
         Biquad {
-            b: [(1.0 + alpha * a) / a0, -2.0 * c / a0, (1.0 - alpha * a) / a0],
+            b: [
+                (1.0 + alpha * a) / a0,
+                -2.0 * c / a0,
+                (1.0 - alpha * a) / a0,
+            ],
             a: [-2.0 * c / a0, (1.0 - alpha / a) / a0],
             z: [0.0; 2],
         }
@@ -251,7 +255,11 @@ impl EchoPath {
 
     /// What the mic hears of `far` (already at the loopback level), before gain.
     pub fn render(&self, far: &[f32]) -> Vec<f32> {
-        let driven = if self.clip { soft_clip(far) } else { far.to_vec() };
+        let driven = if self.clip {
+            soft_clip(far)
+        } else {
+            far.to_vec()
+        };
         let e = convolve(&driven, &self.rir);
         let e = drift(&e, self.drift_ppm);
         let d = (self.delay_ms * SR as f32 / 1000.0) as usize;
@@ -298,12 +306,29 @@ pub struct Utt {
 pub const SPEECH_RMS: f32 = 0.05;
 
 /// far-only (fe1), near-only (ne), double talk (dt_near + dt_far), far-only again (fe2).
-pub fn build_scene(fe1: &Utt, ne: &Utt, dt_near: &Utt, dt_far: &Utt, fe2: &Utt, path: &EchoPath, rng: &mut Rng) -> Scene {
+pub fn build_scene(
+    fe1: &Utt,
+    ne: &Utt,
+    dt_near: &Utt,
+    dt_far: &Utt,
+    fe2: &Utt,
+    path: &EchoPath,
+    rng: &mut Rng,
+) -> Scene {
     let gap = SR; // 1 s between turns
     let tail = (path.delay_ms as usize * SR / 1000) + (path.rt60 * SR as f32) as usize;
     let lead = SR / 2;
     let dt_len = dt_near.samples.len().max(dt_far.samples.len() + SR / 2);
-    let total = lead + fe1.samples.len() + gap + ne.samples.len() + gap + dt_len + gap + fe2.samples.len() + tail + lead;
+    let total = lead
+        + fe1.samples.len()
+        + gap
+        + ne.samples.len()
+        + gap
+        + dt_len
+        + gap
+        + fe2.samples.len()
+        + tail
+        + lead;
     let mut far = vec![0.0f32; total];
     let mut near = vec![0.0f32; total];
     let put = |dst: &mut Vec<f32>, at: usize, u: &Utt| {
@@ -315,26 +340,58 @@ pub fn build_scene(fe1: &Utt, ne: &Utt, dt_near: &Utt, dt_far: &Utt, fe2: &Utt, 
     let mut regions = Vec::new();
     let mut at = lead;
     put(&mut far, at, fe1);
-    regions.push(Region { kind: Kind::FarOnly, start: at, end: at + fe1.samples.len() + tail, near_text: String::new(), far_text: fe1.text.clone() });
+    regions.push(Region {
+        kind: Kind::FarOnly,
+        start: at,
+        end: at + fe1.samples.len() + tail,
+        near_text: String::new(),
+        far_text: fe1.text.clone(),
+    });
     at += fe1.samples.len() + gap;
     put(&mut near, at, ne);
-    regions.push(Region { kind: Kind::NearOnly, start: at, end: at + ne.samples.len(), near_text: ne.text.clone(), far_text: String::new() });
+    regions.push(Region {
+        kind: Kind::NearOnly,
+        start: at,
+        end: at + ne.samples.len(),
+        near_text: ne.text.clone(),
+        far_text: String::new(),
+    });
     at += ne.samples.len() + gap;
     // The far end starts talking 0.5 s into the user's turn.
     put(&mut near, at, dt_near);
     put(&mut far, at + SR / 2, dt_far);
-    regions.push(Region { kind: Kind::Double, start: at, end: at + dt_len, near_text: dt_near.text.clone(), far_text: dt_far.text.clone() });
+    regions.push(Region {
+        kind: Kind::Double,
+        start: at,
+        end: at + dt_len,
+        near_text: dt_near.text.clone(),
+        far_text: dt_far.text.clone(),
+    });
     at += dt_len + gap;
     put(&mut far, at, fe2);
-    regions.push(Region { kind: Kind::FarOnly, start: at, end: (at + fe2.samples.len() + tail).min(total), near_text: String::new(), far_text: fe2.text.clone() });
+    regions.push(Region {
+        kind: Kind::FarOnly,
+        start: at,
+        end: (at + fe2.samples.len() + tail).min(total),
+        near_text: String::new(),
+        far_text: fe2.text.clone(),
+    });
 
     let mut echo = path.render(&far);
     let far_active: Vec<f32> = echo.clone();
     let g = SPEECH_RMS * 10f32.powf(path.echo_db / 20.0) / active_rms(&far_active).max(1e-9);
     echo.iter_mut().for_each(|v| *v *= g);
     let n = noise(rng, total, SPEECH_RMS * 10f32.powf(path.noise_db / 20.0));
-    let mic: Vec<f32> = (0..total).map(|i| (near[i] + echo[i] + n[i]).clamp(-1.0, 1.0)).collect();
-    Scene { mic, far, near, echo, regions }
+    let mic: Vec<f32> = (0..total)
+        .map(|i| (near[i] + echo[i] + n[i]).clamp(-1.0, 1.0))
+        .collect();
+    Scene {
+        mic,
+        far,
+        near,
+        echo,
+        regions,
+    }
 }
 
 /// Scale-invariant SDR of `est` against `reference`, dB.
@@ -343,7 +400,11 @@ pub fn si_sdr(est: &[f32], reference: &[f32]) -> f64 {
     let (e, r) = (&est[..n], &reference[..n]);
     let me = e.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
     let mr = r.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
-    let dot: f64 = e.iter().zip(r).map(|(&a, &b)| (a as f64 - me) * (b as f64 - mr)).sum();
+    let dot: f64 = e
+        .iter()
+        .zip(r)
+        .map(|(&a, &b)| (a as f64 - me) * (b as f64 - mr))
+        .sum();
     let rr: f64 = r.iter().map(|&b| (b as f64 - mr).powi(2)).sum();
     let alpha = dot / rr.max(1e-20);
     let (mut s, mut d) = (0.0f64, 0.0f64);
@@ -387,7 +448,13 @@ pub fn edit_distance(a: &[String], b: &[String]) -> usize {
 }
 
 /// A long call: [far-only, near-only, double talk] turns repeated until `seconds`.
-pub fn build_long_scene(nears: &[Utt], fars: &[Utt], path: &EchoPath, seconds: usize, rng: &mut Rng) -> Scene {
+pub fn build_long_scene(
+    nears: &[Utt],
+    fars: &[Utt],
+    path: &EchoPath,
+    seconds: usize,
+    rng: &mut Rng,
+) -> Scene {
     let total = seconds * SR;
     let mut far = vec![0.0f32; total];
     let mut near = vec![0.0f32; total];
@@ -412,14 +479,32 @@ pub fn build_long_scene(nears: &[Utt], fars: &[Utt], path: &EchoPath, seconds: u
             break;
         }
         put(&mut far, at, fe);
-        regions.push(Region { kind: Kind::FarOnly, start: at, end: at + fe.samples.len() + tail, near_text: String::new(), far_text: fe.text.clone() });
+        regions.push(Region {
+            kind: Kind::FarOnly,
+            start: at,
+            end: at + fe.samples.len() + tail,
+            near_text: String::new(),
+            far_text: fe.text.clone(),
+        });
         at += fe.samples.len() + SR;
         put(&mut near, at, ne);
-        regions.push(Region { kind: Kind::NearOnly, start: at, end: at + ne.samples.len(), near_text: ne.text.clone(), far_text: String::new() });
+        regions.push(Region {
+            kind: Kind::NearOnly,
+            start: at,
+            end: at + ne.samples.len(),
+            near_text: ne.text.clone(),
+            far_text: String::new(),
+        });
         at += ne.samples.len() + SR;
         put(&mut near, at, dn);
         put(&mut far, at + SR / 2, df);
-        regions.push(Region { kind: Kind::Double, start: at, end: at + dt_len, near_text: dn.text.clone(), far_text: df.text.clone() });
+        regions.push(Region {
+            kind: Kind::Double,
+            start: at,
+            end: at + dt_len,
+            near_text: dn.text.clone(),
+            far_text: df.text.clone(),
+        });
         at += dt_len + SR;
         ni += 2;
         fi += 2;
@@ -428,6 +513,14 @@ pub fn build_long_scene(nears: &[Utt], fars: &[Utt], path: &EchoPath, seconds: u
     let g = SPEECH_RMS * 10f32.powf(path.echo_db / 20.0) / active_rms(&echo).max(1e-9);
     echo.iter_mut().for_each(|v| *v *= g);
     let n = noise(rng, total, SPEECH_RMS * 10f32.powf(path.noise_db / 20.0));
-    let mic: Vec<f32> = (0..total).map(|i| (near[i] + echo[i] + n[i]).clamp(-1.0, 1.0)).collect();
-    Scene { mic, far, near, echo, regions }
+    let mic: Vec<f32> = (0..total)
+        .map(|i| (near[i] + echo[i] + n[i]).clamp(-1.0, 1.0))
+        .collect();
+    Scene {
+        mic,
+        far,
+        near,
+        echo,
+        regions,
+    }
 }

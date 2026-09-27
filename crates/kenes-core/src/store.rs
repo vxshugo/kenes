@@ -118,7 +118,9 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA).context("applying schema")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -154,19 +156,35 @@ impl Store {
             "SELECT id, title, started_at, ended_at FROM meetings ORDER BY started_at DESC, rowid DESC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok(MeetingSummary { id: r.get(0)?, title: r.get(1)?, started_at: r.get(2)?, ended_at: r.get(3)? })
+            Ok(MeetingSummary {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                started_at: r.get(2)?,
+                ended_at: r.get(3)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn get_meeting(&self, id: &str) -> Result<Option<Meeting>> {
-        let Some((summary, context, segments, notes)) = self.meeting_parts(id)? else { return Ok(None) };
+        let Some((summary, context, segments, notes)) = self.meeting_parts(id)? else {
+            return Ok(None);
+        };
         let speakers = self.list_speakers(id)?;
-        Ok(Some(Meeting { summary, context, segments, notes, speakers }))
+        Ok(Some(Meeting {
+            summary,
+            context,
+            segments,
+            notes,
+            speakers,
+        }))
     }
 
     #[allow(clippy::type_complexity)]
-    fn meeting_parts(&self, id: &str) -> Result<Option<(MeetingSummary, String, Vec<Segment>, Vec<Note>)>> {
+    fn meeting_parts(
+        &self,
+        id: &str,
+    ) -> Result<Option<(MeetingSummary, String, Vec<Segment>, Vec<Note>)>> {
         let conn = self.conn();
         let head = conn
             .query_row(
@@ -174,13 +192,20 @@ impl Store {
                 [id],
                 |r| {
                     Ok((
-                        MeetingSummary { id: r.get(0)?, title: r.get(1)?, started_at: r.get(2)?, ended_at: r.get(3)? },
+                        MeetingSummary {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            started_at: r.get(2)?,
+                            ended_at: r.get(3)?,
+                        },
                         r.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((summary, context)) = head else { return Ok(None) };
+        let Some((summary, context)) = head else {
+            return Ok(None);
+        };
 
         let mut stmt = conn.prepare(
             "SELECT id, source, speaker, start_ms, end_ms, text FROM segments
@@ -191,7 +216,11 @@ impl Store {
                 let source: String = r.get(1)?;
                 Ok(Segment {
                     id: r.get(0)?,
-                    source: if source == "mic" { Source::Mic } else { Source::System },
+                    source: if source == "mic" {
+                        Source::Mic
+                    } else {
+                        Source::System
+                    },
                     speaker: r.get(2)?,
                     start_ms: r.get::<_, i64>(3)? as u64,
                     end_ms: r.get::<_, i64>(4)? as u64,
@@ -222,7 +251,8 @@ impl Store {
     }
 
     pub fn delete_meeting(&self, id: &str) -> Result<()> {
-        self.conn().execute("DELETE FROM meetings WHERE id = ?1", [id])?;
+        self.conn()
+            .execute("DELETE FROM meetings WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -287,7 +317,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_embedding(&self, meeting_id: &str, segment_id: &str, embedding: &[f32]) -> Result<()> {
+    pub fn save_embedding(
+        &self,
+        meeting_id: &str,
+        segment_id: &str,
+        embedding: &[f32],
+    ) -> Result<()> {
         let blob: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.conn().execute(
             "INSERT OR REPLACE INTO segment_embeddings (meeting_id, segment_id, embedding) VALUES (?1, ?2, ?3)",
@@ -297,23 +332,37 @@ impl Store {
     }
 
     /// Stored embeddings keyed by segment id.
-    pub fn load_embeddings(&self, meeting_id: &str) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+    pub fn load_embeddings(
+        &self,
+        meeting_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT segment_id, embedding FROM segment_embeddings WHERE meeting_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT segment_id, embedding FROM segment_embeddings WHERE meeting_id = ?1",
+        )?;
         let rows = stmt.query_map([meeting_id], |r| {
             let blob: Vec<u8> = r.get(1)?;
-            let emb = blob.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+            let emb = blob
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
             Ok((r.get::<_, String>(0)?, emb))
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn set_segment_speakers(&self, meeting_id: &str, changes: &[(String, Option<String>)]) -> Result<()> {
+    pub fn set_segment_speakers(
+        &self,
+        meeting_id: &str,
+        changes: &[(String, Option<String>)],
+    ) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         {
-            let mut stmt = tx.prepare("UPDATE segments SET speaker = ?3 WHERE meeting_id = ?1 AND id = ?2")?;
+            let mut stmt =
+                tx.prepare("UPDATE segments SET speaker = ?3 WHERE meeting_id = ?1 AND id = ?2")?;
             for (segment_id, speaker) in changes {
                 stmt.execute(params![meeting_id, segment_id, speaker])?;
             }
@@ -322,7 +371,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn save_note(&self, meeting_id: &str, kind: &str, content: &str, trigger: Option<&str>) -> Result<String> {
+    pub fn save_note(
+        &self,
+        meeting_id: &str,
+        kind: &str,
+        content: &str,
+        trigger: Option<&str>,
+    ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         self.conn().execute(
             "INSERT INTO notes (id, meeting_id, kind, content, trigger, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -332,7 +387,10 @@ impl Store {
     }
 
     pub fn get_kv(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.conn().query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+        Ok(self
+            .conn()
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
     }
 
     pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
@@ -364,11 +422,25 @@ mod tests {
     fn meeting_round_trip() {
         let store = Store::open_in_memory().unwrap();
         let m = store.create_meeting("Синк", "повестка").unwrap();
-        store.save_segment(&m.id, &seg("system-1", Source::System, 2000, "қашан бітеді")).unwrap();
-        store.save_segment(&m.id, &seg("mic-1", Source::Mic, 500, "всем привет")).unwrap();
+        store
+            .save_segment(
+                &m.id,
+                &seg("system-1", Source::System, 2000, "қашан бітеді"),
+            )
+            .unwrap();
+        store
+            .save_segment(&m.id, &seg("mic-1", Source::Mic, 500, "всем привет"))
+            .unwrap();
         // Re-saving the same id replaces rather than duplicates.
-        store.save_segment(&m.id, &seg("mic-1", Source::Mic, 500, "всем привет коллеги")).unwrap();
-        let note_id = store.save_note(&m.id, "hint", "- ответ", Some("question")).unwrap();
+        store
+            .save_segment(
+                &m.id,
+                &seg("mic-1", Source::Mic, 500, "всем привет коллеги"),
+            )
+            .unwrap();
+        let note_id = store
+            .save_note(&m.id, "hint", "- ответ", Some("question"))
+            .unwrap();
         store.end_meeting(&m.id).unwrap();
 
         let got = store.get_meeting(&m.id).unwrap().unwrap();
@@ -399,16 +471,39 @@ mod tests {
         store.rename_speaker(&m.id, "sys:9", "Никто").unwrap();
 
         let sp = store.list_speakers(&m.id).unwrap();
-        assert_eq!(sp[0], Speaker { label: "sys:1".into(), name: None, segment_count: 2, talk_ms: 2000 });
-        assert_eq!(sp[1], Speaker { label: "sys:2".into(), name: Some("Айдос".into()), segment_count: 1, talk_ms: 1000 });
+        assert_eq!(
+            sp[0],
+            Speaker {
+                label: "sys:1".into(),
+                name: None,
+                segment_count: 2,
+                talk_ms: 2000
+            }
+        );
+        assert_eq!(
+            sp[1],
+            Speaker {
+                label: "sys:2".into(),
+                name: Some("Айдос".into()),
+                segment_count: 1,
+                talk_ms: 1000
+            }
+        );
         assert_eq!(sp[2].label, "sys:9");
         store.rename_speaker(&m.id, "sys:9", " ").unwrap();
         assert_eq!(store.list_speakers(&m.id).unwrap().len(), 2);
 
-        store.save_embedding(&m.id, "system-1", &[0.5, -1.25, 3.0]).unwrap();
-        assert_eq!(store.load_embeddings(&m.id).unwrap()["system-1"], vec![0.5, -1.25, 3.0]);
+        store
+            .save_embedding(&m.id, "system-1", &[0.5, -1.25, 3.0])
+            .unwrap();
+        assert_eq!(
+            store.load_embeddings(&m.id).unwrap()["system-1"],
+            vec![0.5, -1.25, 3.0]
+        );
 
-        store.set_segment_speakers(&m.id, &[("system-3".into(), Some("sys:2".into()))]).unwrap();
+        store
+            .set_segment_speakers(&m.id, &[("system-3".into(), Some("sys:2".into()))])
+            .unwrap();
         let got = store.get_meeting(&m.id).unwrap().unwrap();
         assert_eq!(got.segments[2].speaker.as_deref(), Some("sys:2"));
         assert_eq!(got.speakers[0].label, "sys:2");
@@ -418,11 +513,16 @@ mod tests {
     fn delete_cascades() {
         let store = Store::open_in_memory().unwrap();
         let m = store.create_meeting("x", "").unwrap();
-        store.save_segment(&m.id, &seg("mic-1", Source::Mic, 0, "a")).unwrap();
+        store
+            .save_segment(&m.id, &seg("mic-1", Source::Mic, 0, "a"))
+            .unwrap();
         store.save_note(&m.id, "summary", "b", None).unwrap();
         store.delete_meeting(&m.id).unwrap();
         assert!(store.get_meeting(&m.id).unwrap().is_none());
-        let n: i64 = store.conn().query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0)).unwrap();
+        let n: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0);
     }
 
@@ -432,7 +532,9 @@ mod tests {
         let m = store.create_meeting("x", "").unwrap();
         let keep = store.create_meeting("y", "").unwrap();
         for id in [&m.id, &keep.id] {
-            store.save_segment(id, &seg("mic-1", Source::Mic, 0, "a")).unwrap();
+            store
+                .save_segment(id, &seg("mic-1", Source::Mic, 0, "a"))
+                .unwrap();
             store.save_note(id, "summary", "b", None).unwrap();
             store.rename_speaker(id, "sys:1", "Айдос").unwrap();
             store.save_embedding(id, "mic-1", &[1.0, 0.0]).unwrap();
@@ -465,7 +567,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let a = store.create_meeting("a", "").unwrap();
         let b = store.create_meeting("b", "").unwrap();
-        let ids: Vec<_> = store.list_meetings().unwrap().into_iter().map(|m| m.id).collect();
+        let ids: Vec<_> = store
+            .list_meetings()
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
         assert_eq!(ids, [b.id, a.id]);
     }
 }

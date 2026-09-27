@@ -21,6 +21,7 @@ pub fn defaults() -> Value {
         "micDevice": null,
         "systemDevice": null,
         "echoCancellation": true,
+        "sttBackend": "auto",
         "claudeModel": "claude-opus-5",
         "hintEffort": "low",
         "summaryEffort": "high",
@@ -56,6 +57,9 @@ pub struct CoreSettings {
     /// when both sources are captured.
     #[serde(default = "enabled")]
     pub echo_cancellation: bool,
+    /// Recognizer runtime: "auto" (per-model default), "ort" or "sherpa".
+    #[serde(default)]
+    pub stt_backend: kenes_stt::SttBackend,
 }
 
 fn enabled() -> bool {
@@ -78,7 +82,10 @@ pub fn save(store: &Store, settings: &Value) -> anyhow::Result<()> {
     anyhow::ensure!(settings.is_object(), "settings must be a JSON object");
     // Validate the keys Rust depends on before persisting anything.
     let mut merged = defaults();
-    merge_into(&mut merged, settings.as_object().cloned().unwrap_or_default());
+    merge_into(
+        &mut merged,
+        settings.as_object().cloned().unwrap_or_default(),
+    );
     core(&merged)?;
     store.set_kv(KEY, &serde_json::to_string(&merged)?)
 }
@@ -111,6 +118,20 @@ mod tests {
     }
 
     #[test]
+    fn stt_backend_defaults_to_auto_and_round_trips() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(
+            core(&load(&store).unwrap()).unwrap().stt_backend,
+            kenes_stt::SttBackend::Auto
+        );
+        save(&store, &json!({"sttBackend": "sherpa"})).unwrap();
+        assert_eq!(
+            core(&load(&store).unwrap()).unwrap().stt_backend,
+            kenes_stt::SttBackend::Sherpa
+        );
+    }
+
+    #[test]
     fn echo_cancellation_can_be_turned_off() {
         let store = Store::open_in_memory().unwrap();
         save(&store, &json!({"echoCancellation": false})).unwrap();
@@ -137,6 +158,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         assert!(save(&store, &json!({"captureMic": "yes"})).is_err());
         assert!(save(&store, &json!({"micMode": "crowd"})).is_err());
+        assert!(save(&store, &json!({"sttBackend": "tensorflow"})).is_err());
         assert!(save(&store, &json!([1, 2])).is_err());
     }
 }

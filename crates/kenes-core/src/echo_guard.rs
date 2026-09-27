@@ -90,7 +90,11 @@ impl EchoGuard {
             Some(last) if start_ms <= last.1 + 1 => last.1 = last.1.max(end_ms),
             _ => self.activity.push_back((start_ms, end_ms)),
         }
-        while self.activity.front().is_some_and(|a| a.1 + HISTORY_MS < end_ms) {
+        while self
+            .activity
+            .front()
+            .is_some_and(|a| a.1 + HISTORY_MS < end_ms)
+        {
             self.activity.pop_front();
         }
     }
@@ -108,9 +112,17 @@ impl EchoGuard {
                 self.sys_open.remove(&seg.id);
                 let text = normalize(&seg.text);
                 if !text.is_empty() {
-                    self.sys_finals.push_back(SysFinal { start_ms: seg.start_ms, end_ms: seg.end_ms, text });
+                    self.sys_finals.push_back(SysFinal {
+                        start_ms: seg.start_ms,
+                        end_ms: seg.end_ms,
+                        text,
+                    });
                     let newest = seg.end_ms;
-                    while self.sys_finals.front().is_some_and(|f| f.end_ms + HISTORY_MS < newest) {
+                    while self
+                        .sys_finals
+                        .front()
+                        .is_some_and(|f| f.end_ms + HISTORY_MS < newest)
+                    {
                         self.sys_finals.pop_front();
                     }
                 }
@@ -127,7 +139,10 @@ impl EchoGuard {
             }
             (Source::Mic, true) => {
                 self.stats.held += 1;
-                self.held.push_back(Held { seg, deadline: now + MAX_HOLD });
+                self.held.push_back(Held {
+                    seg,
+                    deadline: now + MAX_HOLD,
+                });
             }
         }
         self.release(now, false, &mut out);
@@ -179,11 +194,18 @@ impl EchoGuard {
         if !self.active_between(lo, seg.end_ms) {
             return Verdict::Keep;
         }
-        let mut overlapping: Vec<&SysFinal> =
-            self.sys_finals.iter().filter(|f| f.start_ms <= hi && f.end_ms >= lo).collect();
+        let mut overlapping: Vec<&SysFinal> = self
+            .sys_finals
+            .iter()
+            .filter(|f| f.start_ms <= hi && f.end_ms >= lo)
+            .collect();
         overlapping.sort_by_key(|f| f.start_ms);
         if !overlapping.is_empty() {
-            let call: String = overlapping.iter().map(|f| f.text.as_str()).collect::<Vec<_>>().join(" ");
+            let call: String = overlapping
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
             if is_echo(&normalize(&seg.text), &call) {
                 return Verdict::Drop;
             }
@@ -215,7 +237,12 @@ impl EchoGuard {
             let mut finals: Vec<(u64, u64)> = self
                 .sys_finals
                 .iter()
-                .map(|f| (f.start_ms.saturating_sub(COVER_SLACK_MS), f.end_ms + COVER_SLACK_MS))
+                .map(|f| {
+                    (
+                        f.start_ms.saturating_sub(COVER_SLACK_MS),
+                        f.end_ms + COVER_SLACK_MS,
+                    )
+                })
                 .filter(|&(fs, fe)| fs < e && fe > s)
                 .collect();
             finals.sort_unstable();
@@ -249,7 +276,10 @@ pub fn normalize(text: &str) -> String {
 }
 
 fn trigrams(text: &str) -> HashMap<[char; 3], u32> {
-    let chars: Vec<char> = std::iter::once(' ').chain(text.chars()).chain(std::iter::once(' ')).collect();
+    let chars: Vec<char> = std::iter::once(' ')
+        .chain(text.chars())
+        .chain(std::iter::once(' '))
+        .collect();
     let mut grams = HashMap::new();
     for w in chars.windows(3) {
         *grams.entry([w[0], w[1], w[2]]).or_insert(0) += 1;
@@ -267,7 +297,10 @@ pub fn containment(mic: &str, call: &str) -> f32 {
     if total == 0 {
         return 0.0;
     }
-    let shared: u32 = m.iter().map(|(g, &n)| n.min(c.get(g).copied().unwrap_or(0))).sum();
+    let shared: u32 = m
+        .iter()
+        .map(|(g, &n)| n.min(c.get(g).copied().unwrap_or(0)))
+        .sum();
     shared as f32 / total as f32
 }
 
@@ -286,12 +319,29 @@ fn is_echo(mic: &str, call: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn seg(id: &str, source: Source, start_ms: u64, end_ms: u64, text: &str, is_final: bool) -> Segment {
-        Segment { id: id.into(), source, speaker: None, start_ms, end_ms, text: text.into(), is_final }
+    fn seg(
+        id: &str,
+        source: Source,
+        start_ms: u64,
+        end_ms: u64,
+        text: &str,
+        is_final: bool,
+    ) -> Segment {
+        Segment {
+            id: id.into(),
+            source,
+            speaker: None,
+            start_ms,
+            end_ms,
+            text: text.into(),
+            is_final,
+        }
     }
 
     fn texts(v: &[Segment]) -> Vec<(String, String, bool)> {
-        v.iter().map(|s| (s.id.clone(), s.text.clone(), s.is_final)).collect()
+        v.iter()
+            .map(|s| (s.id.clone(), s.text.clone(), s.is_final))
+            .collect()
     }
 
     const CALL: &str = "мы перенесли релиз на следующую среду из за тестов";
@@ -324,17 +374,56 @@ mod tests {
         let t0 = Instant::now();
         let mut g = guard_with_call();
         // The mic transcribes the echo; its partial shows up in the UI.
-        assert_eq!(g.push(seg("mic-3", Source::Mic, 1_200, 4_900, "перенесли релиз", false), t0).len(), 1);
+        assert_eq!(
+            g.push(
+                seg("mic-3", Source::Mic, 1_200, 4_900, "перенесли релиз", false),
+                t0
+            )
+            .len(),
+            1
+        );
         // System partial: the call's utterance is still open.
-        assert_eq!(g.push(seg("system-7", Source::System, 1_000, 3_000, "мы перенесли", false), t0).len(), 1);
+        assert_eq!(
+            g.push(
+                seg(
+                    "system-7",
+                    Source::System,
+                    1_000,
+                    3_000,
+                    "мы перенесли",
+                    false
+                ),
+                t0
+            )
+            .len(),
+            1
+        );
         // The mic final arrives first and is held.
-        assert!(g.push(seg("mic-3", Source::Mic, 1_200, 4_900, "перенесли релиз на следующую среду", true), t0).is_empty());
+        assert!(g
+            .push(
+                seg(
+                    "mic-3",
+                    Source::Mic,
+                    1_200,
+                    4_900,
+                    "перенесли релиз на следующую среду",
+                    true
+                ),
+                t0
+            )
+            .is_empty());
         assert!(g.poll(t0 + Duration::from_millis(500)).is_empty());
         // The system final is emitted at once, followed by the mic final's verdict.
-        let out = g.push(seg("system-7", Source::System, 1_000, 4_800, CALL, true), t0 + Duration::from_millis(600));
+        let out = g.push(
+            seg("system-7", Source::System, 1_000, 4_800, CALL, true),
+            t0 + Duration::from_millis(600),
+        );
         assert_eq!(
             texts(&out),
-            vec![("system-7".into(), CALL.into(), true), ("mic-3".into(), String::new(), true)]
+            vec![
+                ("system-7".into(), CALL.into(), true),
+                ("mic-3".into(), String::new(), true)
+            ]
         );
         assert_eq!(g.stats().dropped, 1);
     }
@@ -343,9 +432,22 @@ mod tests {
     fn dropped_final_without_partials_disappears() {
         let t0 = Instant::now();
         let mut g = guard_with_call();
-        g.push(seg("system-1", Source::System, 1_000, 4_800, CALL, true), t0);
+        g.push(
+            seg("system-1", Source::System, 1_000, 4_800, CALL, true),
+            t0,
+        );
         // A split piece: fresh id, never had partials.
-        let out = g.push(seg("mic-9", Source::Mic, 2_000, 3_500, "релиз на следующую среду", true), t0);
+        let out = g.push(
+            seg(
+                "mic-9",
+                Source::Mic,
+                2_000,
+                3_500,
+                "релиз на следующую среду",
+                true,
+            ),
+            t0,
+        );
         assert!(out.is_empty(), "{out:?}");
         assert!(g.poll(t0 + MAX_HOLD * 2).is_empty());
         assert!(g.finish(t0 + MAX_HOLD * 2).is_empty());
@@ -355,10 +457,33 @@ mod tests {
     fn users_own_words_are_kept() {
         let t0 = Instant::now();
         let mut g = guard_with_call();
-        g.push(seg("system-1", Source::System, 1_000, 4_800, CALL, true), t0);
-        g.push(seg("mic-1", Source::Mic, 2_000, 4_000, "а что с", false), t0);
-        let out = g.push(seg("mic-1", Source::Mic, 2_000, 4_000, "а что с документацией для клиента", true), t0);
-        assert_eq!(texts(&out), vec![("mic-1".into(), "а что с документацией для клиента".into(), true)]);
+        g.push(
+            seg("system-1", Source::System, 1_000, 4_800, CALL, true),
+            t0,
+        );
+        g.push(
+            seg("mic-1", Source::Mic, 2_000, 4_000, "а что с", false),
+            t0,
+        );
+        let out = g.push(
+            seg(
+                "mic-1",
+                Source::Mic,
+                2_000,
+                4_000,
+                "а что с документацией для клиента",
+                true,
+            ),
+            t0,
+        );
+        assert_eq!(
+            texts(&out),
+            vec![(
+                "mic-1".into(),
+                "а что с документацией для клиента".into(),
+                true
+            )]
+        );
     }
 
     #[test]
@@ -366,8 +491,21 @@ mod tests {
         let t0 = Instant::now();
         let mut g = guard_with_call();
         // 10 s: the call has been silent for 5 s, even with a system utterance open elsewhere.
-        g.push(seg("system-2", Source::System, 30_000, 31_000, "потом", false), t0);
-        let out = g.push(seg("mic-5", Source::Mic, 10_000, 12_000, "перенесли релиз на среду", true), t0);
+        g.push(
+            seg("system-2", Source::System, 30_000, 31_000, "потом", false),
+            t0,
+        );
+        let out = g.push(
+            seg(
+                "mic-5",
+                Source::Mic,
+                10_000,
+                12_000,
+                "перенесли релиз на среду",
+                true,
+            ),
+            t0,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(g.stats().dropped, 0);
     }
@@ -377,23 +515,59 @@ mod tests {
         let t0 = Instant::now();
         let mut g = guard_with_call();
         // The call had sound (say, music) but nothing was transcribed.
-        assert!(g.push(seg("mic-2", Source::Mic, 2_000, 3_000, "какой то текст", true), t0).is_empty());
+        assert!(g
+            .push(
+                seg("mic-2", Source::Mic, 2_000, 3_000, "какой то текст", true),
+                t0
+            )
+            .is_empty());
         assert!(g.poll(t0 + Duration::from_millis(2_000)).is_empty());
         let out = g.poll(t0 + MAX_HOLD);
-        assert_eq!(texts(&out), vec![("mic-2".into(), "какой то текст".into(), true)]);
+        assert_eq!(
+            texts(&out),
+            vec![("mic-2".into(), "какой то текст".into(), true)]
+        );
     }
 
     #[test]
     fn mic_finals_leave_in_order_and_system_is_never_held() {
         let t0 = Instant::now();
         let mut g = guard_with_call();
-        assert!(g.push(seg("mic-1", Source::Mic, 1_500, 2_500, "первая фраза пользователя", true), t0).is_empty());
+        assert!(g
+            .push(
+                seg(
+                    "mic-1",
+                    Source::Mic,
+                    1_500,
+                    2_500,
+                    "первая фраза пользователя",
+                    true
+                ),
+                t0
+            )
+            .is_empty());
         // A later mic final that alone could go out waits behind the first one.
         g.system_audio(20_000, 20_032, 0.0);
-        assert!(g.push(seg("mic-2", Source::Mic, 9_000, 9_500, "вторая", true), t0).is_empty());
+        assert!(g
+            .push(seg("mic-2", Source::Mic, 9_000, 9_500, "вторая", true), t0)
+            .is_empty());
         // Partials and system segments pass immediately.
-        assert_eq!(g.push(seg("mic-3", Source::Mic, 10_000, 10_500, "тре", false), t0).len(), 1);
-        let sys = g.push(seg("system-4", Source::System, 1_000, 4_900, "совсем другие слова звонка", true), t0);
+        assert_eq!(
+            g.push(seg("mic-3", Source::Mic, 10_000, 10_500, "тре", false), t0)
+                .len(),
+            1
+        );
+        let sys = g.push(
+            seg(
+                "system-4",
+                Source::System,
+                1_000,
+                4_900,
+                "совсем другие слова звонка",
+                true,
+            ),
+            t0,
+        );
         assert_eq!(sys.len(), 3);
         assert_eq!(sys[0].id, "system-4");
         assert_eq!((sys[1].id.as_str(), sys[2].id.as_str()), ("mic-1", "mic-2"));
@@ -403,7 +577,17 @@ mod tests {
     fn one_word_needs_an_exact_match() {
         let t0 = Instant::now();
         let mut g = guard_with_call();
-        g.push(seg("system-1", Source::System, 1_000, 4_800, "да конечно давайте так", true), t0);
+        g.push(
+            seg(
+                "system-1",
+                Source::System,
+                1_000,
+                4_800,
+                "да конечно давайте так",
+                true,
+            ),
+            t0,
+        );
         g.push(seg("mic-1", Source::Mic, 2_000, 2_400, "да", false), t0);
         let out = g.push(seg("mic-1", Source::Mic, 2_000, 2_400, "да", true), t0);
         assert_eq!(texts(&out), vec![("mic-1".into(), String::new(), true)]);
@@ -418,9 +602,17 @@ mod tests {
         g.push(seg("mic-1", Source::Mic, 1_000, 1_300, "м", false), t0);
         let out = g.push(seg("mic-1", Source::Mic, 1_000, 1_300, "", true), t0);
         assert_eq!(texts(&out), vec![("mic-1".into(), String::new(), true)]);
-        assert!(g.push(seg("mic-2", Source::Mic, 2_000, 3_000, "что то свое", true), t0).is_empty());
+        assert!(g
+            .push(
+                seg("mic-2", Source::Mic, 2_000, 3_000, "что то свое", true),
+                t0
+            )
+            .is_empty());
         let out = g.finish(t0);
-        assert_eq!(texts(&out), vec![("mic-2".into(), "что то свое".into(), true)]);
+        assert_eq!(
+            texts(&out),
+            vec![("mic-2".into(), "что то свое".into(), true)]
+        );
     }
 
     #[test]
@@ -428,10 +620,23 @@ mod tests {
         let t0 = Instant::now();
         let mut g = guard_with_call();
         // Same words, but said by the call 20 s later (outside ±1.5 s).
-        g.push(seg("system-1", Source::System, 22_000, 24_000, CALL, true), t0);
+        g.push(
+            seg("system-1", Source::System, 22_000, 24_000, CALL, true),
+            t0,
+        );
         let out = g.finish(t0);
         assert!(out.is_empty());
-        let out = g.push(seg("mic-1", Source::Mic, 1_500, 3_000, "перенесли релиз на следующую среду", true), t0);
+        let out = g.push(
+            seg(
+                "mic-1",
+                Source::Mic,
+                1_500,
+                3_000,
+                "перенесли релиз на следующую среду",
+                true,
+            ),
+            t0,
+        );
         assert!(out.is_empty(), "held: the call had untranscribed sound");
         let out = g.poll(t0 + MAX_HOLD);
         assert_eq!(out.len(), 1);

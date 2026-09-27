@@ -34,7 +34,13 @@ struct Args {
 
 fn parse_args() -> Result<Args> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../bench/data");
-    let mut a = Args { scenes: 24, asr: true, sweep: false, export: None, data: root };
+    let mut a = Args {
+        scenes: 24,
+        asr: true,
+        sweep: false,
+        export: None,
+        data: root,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -60,8 +66,15 @@ fn load(dir: &Path) -> Result<Vec<Utt>> {
         .into_iter()
         .map(|p| {
             let samples = kenes_audio::wav::read(&p)?;
-            let text = std::fs::read_to_string(p.with_extension("txt")).unwrap_or_default().trim().to_owned();
-            Ok(Utt { name: p.file_stem().unwrap_or_default().to_string_lossy().into(), samples, text })
+            let text = std::fs::read_to_string(p.with_extension("txt"))
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            Ok(Utt {
+                name: p.file_stem().unwrap_or_default().to_string_lossy().into(),
+                samples,
+                text,
+            })
         })
         .collect()
 }
@@ -74,11 +87,19 @@ struct Pools {
 
 /// The base set: near end alternates ru/kk (FLEURS), far end is the other FLEURS language
 /// and Common Voice kk; utterances never repeat between the two sides.
-fn base_scenes(p: &Pools, n: usize, tweak: impl Fn(usize, &mut EchoPath)) -> Vec<(EchoPath, Scene)> {
+fn base_scenes(
+    p: &Pools,
+    n: usize,
+    tweak: impl Fn(usize, &mut EchoPath),
+) -> Vec<(EchoPath, Scene)> {
     (0..n)
         .map(|i| {
             let mut rng = Rng::new(1000 + i as u64);
-            let (nears, fars) = if i % 2 == 0 { (&p.ru, &p.kk) } else { (&p.kk, &p.ru) };
+            let (nears, fars) = if i % 2 == 0 {
+                (&p.ru, &p.kk)
+            } else {
+                (&p.kk, &p.ru)
+            };
             let ne = &nears[(i * 2) % nears.len()];
             let dtn = &nears[(i * 2 + 1) % nears.len()];
             let fe1 = &fars[(30 + i * 2) % fars.len()];
@@ -101,9 +122,17 @@ fn cancel(mic: &[f32], far: &[f32]) -> (Vec<f32>, Duration, kenes_aec::AecStats)
     let mut out: Vec<AudioChunk> = Vec::new();
     for (k, m) in mic.chunks(512).enumerate() {
         let start_ms = k as u64 * 32;
-        out.extend(sc.push(&AudioChunk { source: Source::Mic, start_ms, samples: m.to_vec() }));
+        out.extend(sc.push(&AudioChunk {
+            source: Source::Mic,
+            start_ms,
+            samples: m.to_vec(),
+        }));
         if let Some(f) = far.chunks(512).nth(k) {
-            out.extend(sc.push(&AudioChunk { source: Source::System, start_ms, samples: f.to_vec() }));
+            out.extend(sc.push(&AudioChunk {
+                source: Source::System,
+                start_ms,
+                samples: f.to_vec(),
+            }));
         }
     }
     out.extend(sc.finish());
@@ -131,9 +160,21 @@ struct SignalScore {
 }
 
 fn signal_score(s: &Scene, out: &[f32], mic: &[f32]) -> SignalScore {
-    let fe: Vec<&Region> = s.regions.iter().filter(|r| r.kind == Kind::FarOnly).collect();
-    let ne = s.regions.iter().find(|r| r.kind == Kind::NearOnly).expect("near-only region");
-    let dt = s.regions.iter().find(|r| r.kind == Kind::Double).expect("double-talk region");
+    let fe: Vec<&Region> = s
+        .regions
+        .iter()
+        .filter(|r| r.kind == Kind::FarOnly)
+        .collect();
+    let ne = s
+        .regions
+        .iter()
+        .find(|r| r.kind == Kind::NearOnly)
+        .expect("near-only region");
+    let dt = s
+        .regions
+        .iter()
+        .find(|r| r.kind == Kind::Double)
+        .expect("double-talk region");
     SignalScore {
         erle1: erle(mic, out, fe[0].start, fe[0].end),
         erle2: erle(mic, out, fe[1].start, fe[1].end),
@@ -189,7 +230,9 @@ impl AsrScore {
 fn region_of<'a>(s: &'a Scene, seg: &Segment) -> Option<&'a Region> {
     let mid = (seg.start_ms + seg.end_ms) as usize / 2 * SR / 1000;
     let slack = SR * 3 / 10;
-    s.regions.iter().find(|r| mid + slack >= r.start && mid < r.end + slack)
+    s.regions
+        .iter()
+        .find(|r| mid + slack >= r.start && mid < r.end + slack)
 }
 
 fn asr_score(s: &Scene, segs: &[Segment]) -> AsrScore {
@@ -243,7 +286,10 @@ fn guard(mic: &[Segment], sys: &[Segment], far: &[f32]) -> (Vec<Segment>, echo_g
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     let mut kept = Vec::new();
     let mut take = |v: Vec<Segment>| {
-        kept.extend(v.into_iter().filter(|s| s.is_final && s.source == Source::Mic && !s.text.is_empty()))
+        kept.extend(
+            v.into_iter()
+                .filter(|s| s.is_final && s.source == Source::Mic && !s.text.is_empty()),
+        )
     };
     let end = events.last().map_or(0, |e| e.0) + 5_000;
     let mut next = events.into_iter().peekable();
@@ -257,19 +303,35 @@ fn guard(mic: &[Segment], sys: &[Segment], far: &[f32]) -> (Vec<Segment>, echo_g
     (kept, g.stats().clone())
 }
 
-fn transcribe_all(jobs: Vec<(Source, Vec<f32>)>, threads: usize) -> Result<Vec<Vec<Segment>>> {
+/// Transcribes every job on `threads` recognizers; also returns the recognizer backend used.
+fn transcribe_all(
+    jobs: Vec<(Source, Vec<f32>)>,
+    threads: usize,
+) -> Result<(Vec<Vec<Segment>>, String)> {
     let models = kenes_stt::models_dir();
-    let cfg = SttConfig { models_dir: models, num_threads: 2, ..SttConfig::default() };
-    let jobs: Vec<(usize, Source, Vec<f32>)> = jobs.into_iter().enumerate().map(|(i, (s, a))| (i, s, a)).collect();
+    let cfg = SttConfig {
+        models_dir: models,
+        num_threads: 2,
+        ..SttConfig::default()
+    };
+    let jobs: Vec<(usize, Source, Vec<f32>)> = jobs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (s, a))| (i, s, a))
+        .collect();
     let queue = std::sync::Mutex::new(jobs);
     let results = std::sync::Mutex::new(Vec::new());
+    let backend = std::sync::Mutex::new(String::new());
     std::thread::scope(|scope| -> Result<()> {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| -> Result<()> {
                     let mut t = Transcriber::new(cfg.clone())?;
+                    *backend.lock().unwrap() = format!("{:?}", t.backend());
                     loop {
-                        let Some((i, source, audio)) = queue.lock().unwrap().pop() else { return Ok(()) };
+                        let Some((i, source, audio)) = queue.lock().unwrap().pop() else {
+                            return Ok(());
+                        };
                         let segs = t.transcribe_buffer(source, &audio)?;
                         results.lock().unwrap().push((i, segs));
                     }
@@ -283,7 +345,10 @@ fn transcribe_all(jobs: Vec<(Source, Vec<f32>)>, threads: usize) -> Result<Vec<V
     })?;
     let mut r = results.into_inner().unwrap();
     r.sort_by_key(|x| x.0);
-    Ok(r.into_iter().map(|x| x.1).collect())
+    Ok((
+        r.into_iter().map(|x| x.1).collect(),
+        backend.into_inner().unwrap(),
+    ))
 }
 
 fn main() -> Result<()> {
@@ -294,7 +359,12 @@ fn main() -> Result<()> {
         kk: load(&args.data.join("fleurs_kk"))?,
         cv: load(&args.data.join("cv_kk"))?,
     };
-    println!("utterances: {} ru, {} kk (FLEURS), {} kk (Common Voice)\n", pools.ru.len(), pools.kk.len(), pools.cv.len());
+    println!(
+        "utterances: {} ru, {} kk (FLEURS), {} kk (Common Voice)\n",
+        pools.ru.len(),
+        pools.kk.len(),
+        pools.cv.len()
+    );
 
     if let Some(dir) = &args.export {
         return export(&pools, dir);
@@ -304,8 +374,15 @@ fn main() -> Result<()> {
     }
 
     let scenes = base_scenes(&pools, args.scenes, |_, _| {});
-    let audio_s: f64 = scenes.iter().map(|(_, s)| s.mic.len() as f64 / SR as f64).sum();
-    println!("## Signal level: {} scenes, {:.1} min of audio\n", scenes.len(), audio_s / 60.0);
+    let audio_s: f64 = scenes
+        .iter()
+        .map(|(_, s)| s.mic.len() as f64 / SR as f64)
+        .sum();
+    println!(
+        "## Signal level: {} scenes, {:.1} min of audio\n",
+        scenes.len(),
+        audio_s / 60.0
+    );
     println!("| # | delay ms | echo dB | clip | RT60 s | ERLE fe1 | ERLE fe2 | NE SI-SDR in→out | NE gain dB | DT SI-SDR in→out |");
     println!("|---|---|---|---|---|---|---|---|---|---|");
     let mut cpu = Duration::ZERO;
@@ -332,7 +409,12 @@ fn main() -> Result<()> {
         mean(scores.iter().map(|s| s.dt_in)),
         mean(scores.iter().map(|s| s.dt_out)),
     );
-    println!("AEC CPU: {:.2} s for {:.0} s of audio, RTF {:.4} (one thread)\n", cpu.as_secs_f64(), audio_s, cpu.as_secs_f64() / audio_s);
+    println!(
+        "AEC CPU: {:.2} s for {:.0} s of audio, RTF {:.4} (one thread)\n",
+        cpu.as_secs_f64(),
+        audio_s,
+        cpu.as_secs_f64() / audio_s
+    );
 
     // Headphones: the same scenes without any echo; the canceller must not hurt the user.
     let mut hs = Vec::new();
@@ -360,20 +442,41 @@ fn main() -> Result<()> {
         jobs.push((Source::Mic, hs[i].1.clone()));
     }
     let t = Instant::now();
-    let segs = transcribe_all(jobs, 6)?;
+    let (segs, backend) = transcribe_all(jobs, 6)?;
     eprintln!("transcribed in {:.0} s", t.elapsed().as_secs_f64());
     let mut rows = [AsrScore::default(); 6];
-    let mut gstats = [echo_guard::GuardStats::default(), echo_guard::GuardStats::default()];
+    let mut gstats = [
+        echo_guard::GuardStats::default(),
+        echo_guard::GuardStats::default(),
+    ];
     // (containment, is echo) for every mic final that overlaps system finals.
     let mut pairs: Vec<(f32, bool, usize)> = Vec::new();
+    let mut leaks: Vec<String> = Vec::new();
     for (i, (_, s)) in scenes.iter().enumerate() {
-        let (raw, aec, sys, hraw, haec) = (&segs[i * 5], &segs[i * 5 + 1], &segs[i * 5 + 2], &segs[i * 5 + 3], &segs[i * 5 + 4]);
+        let (raw, aec, sys, hraw, haec) = (
+            &segs[i * 5],
+            &segs[i * 5 + 1],
+            &segs[i * 5 + 2],
+            &segs[i * 5 + 3],
+            &segs[i * 5 + 4],
+        );
         rows[0].add(&asr_score(s, raw));
         rows[1].add(&asr_score(s, aec));
         let (graw, st0) = guard(raw, sys, &s.far);
         let (gaec, st1) = guard(aec, sys, &s.far);
         rows[2].add(&asr_score(s, &graw));
         rows[3].add(&asr_score(s, &gaec));
+        for g in gaec
+            .iter()
+            .filter(|g| region_of(s, g).is_some_and(|r| r.kind == Kind::FarOnly))
+        {
+            leaks.push(format!(
+                "scene {i}, {:.1}–{:.1} s: \"{}\"",
+                g.start_ms as f64 / 1000.0,
+                g.end_ms as f64 / 1000.0,
+                g.text
+            ));
+        }
         rows[4].add(&asr_score(s, hraw));
         rows[5].add(&asr_score(s, haec));
         for (k, st) in [st0, st1].into_iter().enumerate() {
@@ -394,10 +497,17 @@ fn main() -> Result<()> {
             if call.is_empty() || text.is_empty() {
                 continue;
             }
-            pairs.push((echo_guard::containment(&text, &call.join(" ")), r.kind == Kind::FarOnly, text.split(' ').count()));
+            pairs.push((
+                echo_guard::containment(&text, &call.join(" ")),
+                r.kind == Kind::FarOnly,
+                text.split(' ').count(),
+            ));
         }
     }
-    println!("## Recognition (`Transcriber::transcribe_buffer`, {})\n", SttConfig::default().model_id);
+    println!(
+        "## Recognition (`Transcriber::transcribe_buffer`, {}, backend {backend})\n",
+        SttConfig::default().model_id
+    );
     println!("| mic transcript | far-end words leaked (far-only regions) | near-end WER, near-only | near-end WER, double talk |");
     println!("|---|---|---|---|");
     println!("{}", rows[0].row("no AEC"));
@@ -415,6 +525,10 @@ fn main() -> Result<()> {
             st.held_for.as_secs_f64() * 1000.0 / st.held.max(1) as f64
         );
     }
+    println!("\nEcho left after AEC + text guard (far-only turns):\n");
+    for l in &leaks {
+        println!("- {l}");
+    }
     println!("\n### Guard threshold (mic finals overlapping system finals; one-word finals need an exact word match)\n");
     println!("| threshold | echo finals caught | user finals dropped |");
     println!("|---|---|---|");
@@ -422,7 +536,10 @@ fn main() -> Result<()> {
     let user_n = pairs.iter().filter(|p| !p.1 && p.2 > 1).count();
     for th in [0.3f32, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9] {
         let caught = pairs.iter().filter(|p| p.1 && p.2 > 1 && p.0 >= th).count();
-        let false_drop = pairs.iter().filter(|p| !p.1 && p.2 > 1 && p.0 >= th).count();
+        let false_drop = pairs
+            .iter()
+            .filter(|p| !p.1 && p.2 > 1 && p.0 >= th)
+            .count();
         println!("| {th:.1} | {caught} / {echo_n} | {false_drop} / {user_n} |");
     }
     Ok(())
@@ -430,13 +547,18 @@ fn main() -> Result<()> {
 
 /// Delay sweep beyond AEC3's own window, and clock drift over a long call.
 fn sweep(p: &Pools) -> Result<()> {
-    let delays = [0.0f32, 50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 700.0, 850.0, 1000.0];
+    let delays = [
+        0.0f32, 50.0, 150.0, 250.0, 350.0, 450.0, 550.0, 700.0, 850.0, 1000.0,
+    ];
     let scenes = base_scenes(p, delays.len(), |i, path| path.delay_ms = delays[i]);
     println!("## Delay sweep\n\n| delay ms | ERLE fe1 | ERLE fe2 | reference pre-delay ms |\n|---|---|---|---|");
     for (path, s) in &scenes {
         let (out, _, st) = cancel(&s.mic, &s.far);
         let sc = signal_score(s, &out, &s.mic);
-        println!("| {:.0} | {:.1} | {:.1} | {} |", path.delay_ms, sc.erle1, sc.erle2, st.reference_delay_ms);
+        println!(
+            "| {:.0} | {:.1} | {:.1} | {} |",
+            path.delay_ms, sc.erle1, sc.erle2, st.reference_delay_ms
+        );
     }
     for (ppm, d0) in [(300.0f32, 150.0f32), (-300.0, 400.0), (600.0, 150.0)] {
         let secs = 1200;
@@ -450,7 +572,11 @@ fn sweep(p: &Pools) -> Result<()> {
         let end = d0 + ppm * 1e-6 * secs as f32 * 1000.0;
         println!("\n### {secs} s call, drift {ppm:+} ppm: echo delay {d0:.0} → {end:.0} ms ({} re-alignments)\n", st.realignments);
         println!("| minute | ERLE (far-only turns) |\n|---|---|");
-        let fes: Vec<&Region> = s.regions.iter().filter(|r| r.kind == Kind::FarOnly).collect();
+        let fes: Vec<&Region> = s
+            .regions
+            .iter()
+            .filter(|r| r.kind == Kind::FarOnly)
+            .collect();
         for minute in 0..secs / 60 {
             let (a, b) = (minute * 60 * SR, (minute + 1) * 60 * SR);
             let (mut ein, mut eout) = (0.0, 0.0);
@@ -477,7 +603,15 @@ fn export(p: &Pools, dir: &Path) -> Result<()> {
     // Different utterances from the base set's first scenes.
     let nears: Vec<&Utt> = p.ru.iter().skip(40).take(8).collect();
     let fars: Vec<&Utt> = p.kk.iter().skip(10).take(8).collect();
-    let own = |v: Vec<&Utt>| v.into_iter().map(|u| Utt { name: u.name.clone(), samples: u.samples.clone(), text: u.text.clone() }).collect::<Vec<_>>();
+    let own = |v: Vec<&Utt>| {
+        v.into_iter()
+            .map(|u| Utt {
+                name: u.name.clone(),
+                samples: u.samples.clone(),
+                text: u.text.clone(),
+            })
+            .collect::<Vec<_>>()
+    };
     let s = build_long_scene(&own(nears), &own(fars), &path, 180, &mut rng);
     kenes_audio::wav::write(dir.join("mic_with_echo.wav"), &s.mic)?;
     kenes_audio::wav::write(dir.join("far.wav"), &s.far)?;
@@ -492,6 +626,13 @@ fn export(p: &Pools, dir: &Path) -> Result<()> {
         script += &format!("[{}–{}] {:?} {}\n", t(r.start), t(r.end), r.kind, who);
     }
     std::fs::write(dir.join("script.txt"), script)?;
-    println!("wrote {} ({:.0} s): echo {} dB, delay {} ms, RT60 {:.2} s", dir.display(), s.mic.len() as f64 / SR as f64, path.echo_db, path.delay_ms, path.rt60);
+    println!(
+        "wrote {} ({:.0} s): echo {} dB, delay {} ms, RT60 {:.2} s",
+        dir.display(),
+        s.mic.len() as f64 / SR as f64,
+        path.echo_db,
+        path.delay_ms,
+        path.rt60
+    );
     Ok(())
 }

@@ -320,10 +320,9 @@ Global shortcuts (`app/src-tauri/src/hotkeys.rs`):
 type Settings = {
   // read by Rust
   sttModel: string;            // default "gigaam-multilingual-ctc"
-  sttBackend: "auto" | "ort" | "sherpa"; // default "auto" (= "ort" for every model today). kenes-core parses it
-                               // leniently (unknown → auto) and passes it to Transcriber::with_backend (TODO in
-                               // kenes-core; until then every session uses "auto"). UI: an advanced option,
-                               // "sherpa" = the old front-end; applies to the next session
+  sttBackend: "auto" | "ort" | "sherpa"; // default "auto" (= "ort" for every model today). kenes-core passes it to
+                               // Transcriber::with_backend; save_settings rejects other values. Settings tab:
+                               // «Движок распознавания», applies to the next session
   numThreads: number;          // default 4
   captureMic: boolean;         // default true
   captureSystem: boolean;      // default true

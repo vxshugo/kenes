@@ -86,12 +86,20 @@ impl DelayTracker {
     fn correlate(&self) -> Option<usize> {
         // Correlate the newest `n` frames: the whole window once there is enough
         // history for every lag, a shorter one (at least MIN_WINDOW) early on.
-        let n = self.near.len().min(self.far.len().saturating_sub(self.max_lag));
+        let n = self
+            .near
+            .len()
+            .min(self.far.len().saturating_sub(self.max_lag));
         if n < MIN_WINDOW {
             return None;
         }
         let far: Vec<f32> = self.far.iter().copied().collect();
-        let near: Vec<f32> = self.near.iter().skip(self.near.len() - n).copied().collect();
+        let near: Vec<f32> = self
+            .near
+            .iter()
+            .skip(self.near.len() - n)
+            .copied()
+            .collect();
         // Enough far-end sound in the searched history to say anything?
         let active = far.iter().filter(|&&v| v > ACTIVE_DB).count();
         if active * 4 < n {
@@ -111,10 +119,18 @@ impl DelayTracker {
                 scores.push(f32::MIN);
                 continue;
             }
-            let cov: f64 = seg.iter().zip(&near).map(|(&a, &b)| (a - m) as f64 * (b - near_mean) as f64).sum::<f64>() / n as f64;
+            let cov: f64 = seg
+                .iter()
+                .zip(&near)
+                .map(|(&a, &b)| (a - m) as f64 * (b - near_mean) as f64)
+                .sum::<f64>()
+                / n as f64;
             scores.push((cov / (v as f64 * near_var as f64).sqrt()) as f32);
         }
-        let (best, &peak) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+        let (best, &peak) = scores
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))?;
         let runner_up = scores
             .iter()
             .enumerate()
@@ -146,13 +162,19 @@ mod tests {
     fn bursts(seed: u64, frames: usize) -> Vec<f32> {
         let mut s = seed;
         let mut rnd = move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
         };
         let mut out = Vec::with_capacity(frames * FRAME);
         while out.len() < frames * FRAME {
             let len = ((rnd() + 0.5) * 30.0) as usize + 5;
-            let level = if rnd() > 0.0 { (rnd() + 0.6) * 0.2 } else { 0.0 };
+            let level = if rnd() > 0.0 {
+                (rnd() + 0.6) * 0.2
+            } else {
+                0.0
+            };
             for _ in 0..len * FRAME {
                 out.push(rnd() * level);
             }
@@ -171,7 +193,11 @@ mod tests {
             let near: Vec<f32> = (0..FRAME)
                 .map(|i| {
                     let n = k * FRAME + i;
-                    let e = if n >= delay_frames * FRAME { far[n - delay_frames * FRAME] * echo_gain } else { 0.0 };
+                    let e = if n >= delay_frames * FRAME {
+                        far[n - delay_frames * FRAME] * echo_gain
+                    } else {
+                        0.0
+                    };
                     e + talk[n] * near_level
                 })
                 .collect();

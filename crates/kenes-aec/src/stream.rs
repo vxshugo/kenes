@@ -133,7 +133,10 @@ impl StreamCanceller {
         self.far_end = Some(self.far_end.unwrap_or(at) + samples.len() as u64);
         // Drop reference audio from before the mic's current position.
         if self.near_started {
-            let used = self.near_start.saturating_sub(self.far_start).min(self.far.len() as u64) as usize;
+            let used = self
+                .near_start
+                .saturating_sub(self.far_start)
+                .min(self.far.len() as u64) as usize;
             self.far.drain(..used);
             self.far_start += used as u64;
         }
@@ -163,7 +166,11 @@ impl StreamCanceller {
             for (i, v) in far.iter_mut().enumerate() {
                 let pos = n + i as u64;
                 if pos >= self.far_start {
-                    *v = self.far.get((pos - self.far_start) as usize).copied().unwrap_or(0.0);
+                    *v = self
+                        .far
+                        .get((pos - self.far_start) as usize)
+                        .copied()
+                        .unwrap_or(0.0);
                 }
             }
             let mut frame = [0.0f32; FRAME];
@@ -177,7 +184,10 @@ impl StreamCanceller {
             }
             self.near_start += real as u64;
             // The reference up to here is used up.
-            let used = self.near_start.saturating_sub(self.far_start).min(self.far.len() as u64) as usize;
+            let used = self
+                .near_start
+                .saturating_sub(self.far_start)
+                .min(self.far.len() as u64) as usize;
             self.far.drain(..used);
             self.far_start += used as u64;
             self.emit(&frame, out);
@@ -188,11 +198,16 @@ impl StreamCanceller {
     fn emit(&mut self, frame: &[f32], out: &mut Vec<AudioChunk>) {
         let mut rest = frame;
         while !rest.is_empty() {
-            let Some((pos, len)) = self.fed.pop_front() else { break };
+            let Some((pos, len)) = self.fed.pop_front() else {
+                break;
+            };
             let take = len.min(rest.len());
             if let Some(pos) = pos {
                 match out.last_mut() {
-                    Some(last) if last.start_ms * SAMPLES_PER_MS as u64 + last.samples.len() as u64 == pos => {
+                    Some(last)
+                        if last.start_ms * SAMPLES_PER_MS as u64 + last.samples.len() as u64
+                            == pos =>
+                    {
                         last.samples.extend_from_slice(&rest[..take]);
                     }
                     _ => out.push(AudioChunk {
@@ -217,7 +232,11 @@ mod tests {
     use crate::testutil::*;
 
     fn chunk(source: Source, start_ms: u64, samples: &[f32]) -> AudioChunk {
-        AudioChunk { source, start_ms, samples: samples.to_vec() }
+        AudioChunk {
+            source,
+            start_ms,
+            samples: samples.to_vec(),
+        }
     }
 
     /// Feeds two whole signals as 32 ms chunks, the mic first at each position.
@@ -236,7 +255,10 @@ mod tests {
     }
 
     fn concat(chunks: &[AudioChunk]) -> Vec<f32> {
-        chunks.iter().flat_map(|c| c.samples.iter().copied()).collect()
+        chunks
+            .iter()
+            .flat_map(|c| c.samples.iter().copied())
+            .collect()
     }
 
     fn assert_contiguous(chunks: &[AudioChunk], from_ms: u64) {
@@ -269,7 +291,10 @@ mod tests {
 
     #[test]
     fn mic_waits_for_its_reference_but_not_forever() {
-        let cfg = AecConfig { max_wait_ms: 100, ..Default::default() };
+        let cfg = AecConfig {
+            max_wait_ms: 100,
+            ..Default::default()
+        };
         let mut sc = StreamCanceller::new(cfg);
         let m = noise(3, 512, 0.1);
         // Reference for 0–64 ms arrived; mic chunks keep coming.
@@ -287,7 +312,11 @@ mod tests {
         assert!(sc.push(&chunk(Source::Mic, 128, &m)).is_empty());
         let late = sc.push(&chunk(Source::Mic, 160, &m));
         assert!(!late.is_empty());
-        assert!(sc.pending_ms() <= 100 + 10, "pending {} ms", sc.pending_ms());
+        assert!(
+            sc.pending_ms() <= 100 + 10,
+            "pending {} ms",
+            sc.pending_ms()
+        );
         // The reference arriving now releases the rest.
         let rest = sc.push(&chunk(Source::System, 64, &noise(5, 512 * 4, 0.1)));
         assert!(!rest.is_empty());
@@ -297,7 +326,11 @@ mod tests {
     #[test]
     fn reference_arriving_first_or_second_gives_the_same_output() {
         let far = noise(6, 16_000 * 3, 0.1);
-        let mic: Vec<f32> = echo(&far, 800, 0.4).iter().zip(noise(7, far.len(), 0.01)).map(|(a, b)| a + b).collect();
+        let mic: Vec<f32> = echo(&far, 800, 0.4)
+            .iter()
+            .zip(noise(7, far.len(), 0.01))
+            .map(|(a, b)| a + b)
+            .collect();
         let mut a = StreamCanceller::new(AecConfig::default());
         let out_a = feed(&mut a, &mic, Some(&far));
         // Same data, reference chunk before the mic chunk at each position.
@@ -335,7 +368,11 @@ mod tests {
         assert_eq!(starts.first(), Some(&0));
         assert!(out.iter().any(|c| c.start_ms == 364), "{starts:?}");
         // Pieces before the gap are contiguous and end at 64 ms.
-        let before: usize = out.iter().filter(|c| c.start_ms < 364).map(|c| c.samples.len()).sum();
+        let before: usize = out
+            .iter()
+            .filter(|c| c.start_ms < 364)
+            .map(|c| c.samples.len())
+            .sum();
         assert_eq!(before, 1024);
     }
 

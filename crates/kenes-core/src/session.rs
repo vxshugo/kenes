@@ -18,7 +18,7 @@
 //! utterance as a final segment before the worker exits.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,9 @@ use crossbeam_channel::{after, bounded, select, unbounded, Receiver, Sender};
 use kenes_aec::{AecConfig, StreamCanceller};
 use kenes_audio::{CaptureConfig, DeviceSel};
 use kenes_stt::{SttConfig, Transcriber};
-use kenes_types::{AudioChunk, PipelineEvent, Segment, SessionState, Source, SpeakerChange, SAMPLE_RATE};
+use kenes_types::{
+    AudioChunk, PipelineEvent, Segment, SessionState, Source, SpeakerChange, SAMPLE_RATE,
+};
 
 use crate::diarize::{self, Diarizer};
 use crate::echo_guard::EchoGuard;
@@ -44,7 +46,11 @@ pub enum AudioInput {
     Capture,
     /// Recorded WAV files (e.g. from `kenes-rec`) replayed through the same pipeline,
     /// `speed` times faster than real time. The session ends when the files do.
-    Files { mic: Option<PathBuf>, system: Option<PathBuf>, speed: f32 },
+    Files {
+        mic: Option<PathBuf>,
+        system: Option<PathBuf>,
+        speed: f32,
+    },
 }
 
 pub const VAD_MODEL: &str = "silero-vad";
@@ -68,6 +74,20 @@ pub struct SessionManager {
     current: Mutex<Option<Running>>,
     /// Last status the pipeline reported, so a reloaded UI can catch up.
     state: Arc<Mutex<SessionState>>,
+    /// Bumped per session and when a stuck worker is detached: events and status
+    /// from an older generation never reach the UI (segment ids restart per session).
+    generation: Arc<AtomicU64>,
+}
+
+/// Forwards events only while `generation` still equals `mine`.
+fn gated(sink: EventSink, generation: Arc<AtomicU64>, mine: u64) -> EventSink {
+    Arc::new(move |ev| {
+        if generation.load(Ordering::SeqCst) == mine {
+            sink(ev);
+        } else {
+            log::debug!("dropping event from a finished session: {ev:?}");
+        }
+    })
 }
 
 /// The running session, for a UI that (re)attaches mid-meeting.
@@ -88,7 +108,14 @@ impl SessionManager {
             }
             sink(ev)
         });
-        Self { store, sink, models_dir, current: Mutex::new(None), state }
+        Self {
+            store,
+            sink,
+            models_dir,
+            current: Mutex::new(None),
+            state,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
     }
 
     pub fn live(&self) -> Option<LiveSession> {
@@ -133,6 +160,7 @@ impl SessionManager {
             bail!("both microphone and system audio capture are disabled");
         }
         let meeting = self.store.create_meeting(title, context)?;
+        let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let stop = Arc::new(AtomicBool::new(false));
         let (done_tx, done_rx) = bounded(1);
 
@@ -142,7 +170,7 @@ impl SessionManager {
             input,
             models_dir: self.models_dir.clone(),
             store: self.store.clone(),
-            sink: self.sink.clone(),
+            sink: gated(self.sink.clone(), self.generation.clone(), mine),
             stop: stop.clone(),
         };
         std::thread::Builder::new()
@@ -153,7 +181,9 @@ impl SessionManager {
                     Ok(()) => sink(status(SessionState::Idle, None)),
                     Err(e) => {
                         log::error!("session failed: {e:#}");
-                        sink(PipelineEvent::Error { message: format!("{e:#}") });
+                        sink(PipelineEvent::Error {
+                            message: format!("{e:#}"),
+                        });
                         sink(status(SessionState::Error, Some(format!("{e:#}"))));
                     }
                 }
@@ -161,17 +191,26 @@ impl SessionManager {
             })
             .context("spawning session thread")?;
 
-        *self.current.lock().unwrap() = Some(Running { meeting_id: meeting.id.clone(), stop, done: done_rx });
+        *self.current.lock().unwrap() = Some(Running {
+            meeting_id: meeting.id.clone(),
+            stop,
+            done: done_rx,
+        });
         Ok(meeting.id)
     }
 
     /// Stops the running session, waiting for the last utterance to be transcribed.
     pub fn stop(&self) -> Result<()> {
-        let Some(running) = self.current.lock().unwrap().take() else { return Ok(()) };
+        let Some(running) = self.current.lock().unwrap().take() else {
+            return Ok(());
+        };
         running.stop.store(true, Ordering::SeqCst);
         if running.done.recv_timeout(STOP_TIMEOUT).is_err() {
             // Most likely stuck in a model download; it checks the flag when done.
             log::warn!("session worker did not stop within {STOP_TIMEOUT:?}; detaching");
+            // Silence it: whatever it emits later belongs to a meeting the UI has closed.
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            *self.state.lock().unwrap_or_else(|e| e.into_inner()) = SessionState::Idle;
         }
         self.store.end_meeting(&running.meeting_id)
     }
@@ -204,7 +243,10 @@ impl Worker {
             // Throttle to whole percents; downloads report far more often.
             if p >= 1.0 || p - last >= 0.01 {
                 last = p;
-                sink(PipelineEvent::ModelProgress { model: name.clone(), progress: p });
+                sink(PipelineEvent::ModelProgress {
+                    model: name.clone(),
+                    progress: p,
+                });
             }
         }
     }
@@ -214,8 +256,11 @@ impl Worker {
     fn load_diarizer(&self) -> (Diarizer, Option<PathBuf>) {
         let needs_model = self.settings.mic_mode == MicMode::Room || self.settings.capture_system;
         let embedder = if needs_model {
-            let loaded = kenes_speakers::ensure_speaker_model(&self.models_dir, &mut self.progress_sink(SPEAKER_MODEL))
-                .and_then(|path| Ok((kenes_speakers::Embedder::new(&path, 1)?, path)));
+            let loaded = kenes_speakers::ensure_speaker_model(
+                &self.models_dir,
+                &mut self.progress_sink(SPEAKER_MODEL),
+            )
+            .and_then(|path| Ok((kenes_speakers::Embedder::new(&path, 1)?, path)));
             match loaded {
                 Ok(e) => Some(e),
                 Err(e) => {
@@ -237,11 +282,17 @@ impl Worker {
             }
         };
         let (embedder, path) = embedder.unzip();
-        (Diarizer::new(embedder, self.settings.mic_mode, voiceprint), path)
+        (
+            Diarizer::new(embedder, self.settings.mic_mode, voiceprint),
+            path,
+        )
     }
 
     fn run(self) -> Result<()> {
-        (self.sink)(status(SessionState::Loading, Some("Загрузка моделей распознавания".into())));
+        (self.sink)(status(
+            SessionState::Loading,
+            Some("Загрузка моделей распознавания".into()),
+        ));
         for model in [VAD_MODEL, self.settings.stt_model.as_str()] {
             if self.stopped() {
                 return Ok(());
@@ -250,14 +301,21 @@ impl Worker {
                 .with_context(|| format!("загрузка модели {model}"))?;
         }
 
-        let mut transcriber = Transcriber::new(SttConfig {
-            model_id: self.settings.stt_model.clone(),
-            models_dir: self.models_dir.clone(),
-            num_threads: self.settings.num_threads,
-            partial_interval_ms: 700,
-            max_segment_ms: 20_000,
-        })
+        let mut transcriber = Transcriber::with_backend(
+            SttConfig {
+                model_id: self.settings.stt_model.clone(),
+                models_dir: self.models_dir.clone(),
+                num_threads: self.settings.num_threads,
+                partial_interval_ms: 700,
+                max_segment_ms: 20_000,
+            },
+            self.settings.stt_backend,
+        )
         .context("инициализация распознавания")?;
+        log::info!(
+            "speech recognition on the {:?} backend",
+            transcriber.backend()
+        );
         let (mut diarizer, speaker_model) = self.load_diarizer();
         if let Some(path) = speaker_model {
             // People often answer without a pause, so the VAD glues their turns together;
@@ -283,7 +341,9 @@ impl Worker {
         let (audio_tx, audio_rx) = unbounded::<AudioChunk>();
         let capture = match &self.input {
             AudioInput::Capture => {
-                let sel = |on: bool, dev: &Option<String>| on.then(|| DeviceSel::from_option(dev.clone()));
+                let sel = |on: bool, dev: &Option<String>| {
+                    on.then(|| DeviceSel::from_option(dev.clone()))
+                };
                 let handle = kenes_audio::start_capture(
                     CaptureConfig {
                         mic: sel(self.settings.capture_mic, &self.settings.mic_device),
@@ -294,9 +354,13 @@ impl Worker {
                 .context("запуск захвата звука")?;
                 Audio::Live(handle)
             }
-            AudioInput::Files { mic, system, speed } => {
-                Audio::Replay(replay::start(mic.as_deref(), system.as_deref(), *speed, audio_tx, self.stop.clone())?)
-            }
+            AudioInput::Files { mic, system, speed } => Audio::Replay(replay::start(
+                mic.as_deref(),
+                system.as_deref(),
+                *speed,
+                audio_tx,
+                self.stop.clone(),
+            )?),
         };
         let capture_errors = match &capture {
             Audio::Live(h) => h.errors(),
@@ -305,7 +369,9 @@ impl Worker {
         (self.sink)(status(SessionState::Running, None));
 
         // Without headphones the mic hears the call too: cancel it against the system audio.
-        let echo = self.settings.echo_cancellation && self.settings.capture_mic && self.settings.capture_system;
+        let echo = self.settings.echo_cancellation
+            && self.settings.capture_mic
+            && self.settings.capture_system;
         let mut route = Route {
             levels: Levels::default(),
             forward: Some(stt_tx),
@@ -359,7 +425,8 @@ impl Worker {
             self.on_audio(&mut route, &mut diarizer, chunk);
         }
         if let Some(mut canceller) = route.canceller.take() {
-            let rest = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.finish()));
+            let rest =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.finish()));
             for chunk in rest.unwrap_or_default() {
                 self.deliver(&mut route, &mut diarizer, chunk);
             }
@@ -386,7 +453,10 @@ impl Worker {
             }
             let changes = changes
                 .into_iter()
-                .map(|(segment_id, speaker)| SpeakerChange { segment_id, speaker })
+                .map(|(segment_id, speaker)| SpeakerChange {
+                    segment_id,
+                    speaker,
+                })
                 .collect();
             (self.sink)(PipelineEvent::SpeakersRelabeled { changes });
         }
@@ -400,15 +470,19 @@ impl Worker {
             return self.deliver(route, diarizer, chunk);
         };
         // Third-party DSP: if it ever panics, carry on without it rather than end the meeting.
-        let ready = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.push(&chunk))) {
-            Ok(ready) => ready,
-            Err(_) => {
-                log::error!("echo canceller panicked; the mic passes through from now on");
-                (self.sink)(PipelineEvent::Error { message: "эхоподавление отключено из-за внутренней ошибки".into() });
-                route.canceller = None;
-                return self.deliver(route, diarizer, chunk);
-            }
-        };
+        let ready =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| canceller.push(&chunk)))
+            {
+                Ok(ready) => ready,
+                Err(_) => {
+                    log::error!("echo canceller panicked; the mic passes through from now on");
+                    (self.sink)(PipelineEvent::Error {
+                        message: "эхоподавление отключено из-за внутренней ошибки".into(),
+                    });
+                    route.canceller = None;
+                    return self.deliver(route, diarizer, chunk);
+                }
+            };
         if chunk.source == Source::System {
             self.deliver(route, diarizer, chunk);
         }
@@ -423,14 +497,20 @@ impl Worker {
             (self.sink)(ev);
         }
         if let (Some(guard), Source::System) = (&mut route.guard, chunk.source) {
-            guard.system_audio(chunk.start_ms, chunk.start_ms + chunk.duration_ms(), kenes_audio::pcm::rms(&chunk.samples));
+            guard.system_audio(
+                chunk.start_ms,
+                chunk.start_ms + chunk.duration_ms(),
+                kenes_audio::pcm::rms(&chunk.samples),
+            );
         }
         diarizer.push_audio(&chunk);
         if let Some(tx) = &route.forward {
             if tx.send(chunk).is_err() {
                 // The transcriber died; keep draining audio so capture isn't blocked.
                 route.forward = None;
-                (self.sink)(PipelineEvent::Error { message: "распознавание остановилось".into() });
+                (self.sink)(PipelineEvent::Error {
+                    message: "распознавание остановилось".into(),
+                });
             }
         }
     }
@@ -503,34 +583,44 @@ mod replay {
         stop: Arc<AtomicBool>,
     ) -> Result<std::thread::JoinHandle<()>> {
         let load = |p: Option<&Path>| -> Result<Vec<f32>> {
-            p.map_or(Ok(Vec::new()), |p| kenes_audio::wav::read(p).with_context(|| format!("чтение {}", p.display())))
+            p.map_or(Ok(Vec::new()), |p| {
+                kenes_audio::wav::read(p).with_context(|| format!("чтение {}", p.display()))
+            })
         };
         let (mic, system) = (load(mic)?, load(system)?);
         let speed = if speed > 0.0 { speed } else { 1.0 };
-        let thread = std::thread::Builder::new().name("kenes-replay".into()).spawn(move || {
-            let started = Instant::now();
-            let len = mic.len().max(system.len());
-            for at in (0..len).step_by(CHUNK_SAMPLES) {
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                let start_ms = at as u64 * 1000 / SAMPLE_RATE as u64;
-                for (source, samples) in [(Source::Mic, &mic), (Source::System, &system)] {
-                    if at < samples.len() {
-                        let end = (at + CHUNK_SAMPLES).min(samples.len());
-                        let chunk = AudioChunk { source, start_ms, samples: samples[at..end].to_vec() };
-                        if tx.send(chunk).is_err() {
-                            return;
+        let thread = std::thread::Builder::new()
+            .name("kenes-replay".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let len = mic.len().max(system.len());
+                for at in (0..len).step_by(CHUNK_SAMPLES) {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let start_ms = at as u64 * 1000 / SAMPLE_RATE as u64;
+                    for (source, samples) in [(Source::Mic, &mic), (Source::System, &system)] {
+                        if at < samples.len() {
+                            let end = (at + CHUNK_SAMPLES).min(samples.len());
+                            let chunk = AudioChunk {
+                                source,
+                                start_ms,
+                                samples: samples[at..end].to_vec(),
+                            };
+                            if tx.send(chunk).is_err() {
+                                return;
+                            }
                         }
                     }
+                    // Pace like a live stream so the speaker ring buffer still holds each final's audio.
+                    let due = Duration::from_secs_f64(
+                        (at + CHUNK_SAMPLES) as f64 / SAMPLE_RATE as f64 / speed as f64,
+                    );
+                    if let Some(wait) = due.checked_sub(started.elapsed()) {
+                        std::thread::sleep(wait);
+                    }
                 }
-                // Pace like a live stream so the speaker ring buffer still holds each final's audio.
-                let due = Duration::from_secs_f64((at + CHUNK_SAMPLES) as f64 / SAMPLE_RATE as f64 / speed as f64);
-                if let Some(wait) = due.checked_sub(started.elapsed()) {
-                    std::thread::sleep(wait);
-                }
-            }
-        })?;
+            })?;
         Ok(thread)
     }
 }
@@ -560,7 +650,10 @@ impl Levels {
             acc.1 += 1;
             if acc.1 == LEVEL_WINDOW {
                 let rms = (acc.0 / acc.1 as f64).sqrt() as f32;
-                out.push(PipelineEvent::Level { source: chunk.source, rms });
+                out.push(PipelineEvent::Level {
+                    source: chunk.source,
+                    rms,
+                });
                 *acc = (0.0, 0);
             }
         }
@@ -571,6 +664,36 @@ impl Levels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_from_an_older_generation_are_dropped() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let base: EventSink = Arc::new(move |ev| log.lock().unwrap().push(ev));
+        let generation = Arc::new(AtomicU64::new(1));
+        let old = gated(base.clone(), generation.clone(), 1);
+        old(PipelineEvent::Error {
+            message: "a".into(),
+        });
+        generation.fetch_add(1, Ordering::SeqCst); // the next session starts
+        let new = gated(base, generation, 2);
+        old(PipelineEvent::Error {
+            message: "late".into(),
+        });
+        new(PipelineEvent::Error {
+            message: "b".into(),
+        });
+        let got: Vec<_> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| match e {
+                PipelineEvent::Error { message } => message.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(got, ["a", "b"]);
+    }
 
     #[test]
     fn lone_letters_are_noise() {
@@ -592,7 +715,11 @@ mod tests {
     #[test]
     fn levels_emit_per_window() {
         let mut l = Levels::default();
-        let chunk = AudioChunk { source: Source::Mic, start_ms: 0, samples: vec![0.5; LEVEL_WINDOW * 2 + 10] };
+        let chunk = AudioChunk {
+            source: Source::Mic,
+            start_ms: 0,
+            samples: vec![0.5; LEVEL_WINDOW * 2 + 10],
+        };
         let evs = l.push(&chunk);
         assert_eq!(evs.len(), 2);
         match &evs[0] {
@@ -603,7 +730,11 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         // The 10 leftover samples carry over into the next window.
-        let evs = l.push(&AudioChunk { source: Source::Mic, start_ms: 0, samples: vec![0.0; LEVEL_WINDOW - 10] });
+        let evs = l.push(&AudioChunk {
+            source: Source::Mic,
+            start_ms: 0,
+            samples: vec![0.0; LEVEL_WINDOW - 10],
+        });
         assert_eq!(evs.len(), 1);
     }
 }
